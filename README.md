@@ -48,6 +48,17 @@ PYTHONPATH=src python -m stateful_llm_compiler.reference_check \
   --out artifacts/differential_results.json
 ```
 
+运行 RMSNorm GPU 基准：
+
+```bash
+PYTHONPATH=src python benchmarks/bench_rmsnorm.py \
+  --rows 1,8,32,128 \
+  --hidden-sizes 64,1536 \
+  --dtypes fp16,fp32 \
+  --inductor \
+  --out artifacts/rmsnorm_benchmark.json
+```
+
 运行测试：
 
 ```bash
@@ -73,10 +84,12 @@ attention_mask: [batch, 1, sequence, sequence]
 - `docs/serveir.md`：ServeIR、SSA 和 KV 副作用设计。
 - `docs/passes.md`：Use-Def、PassManager 和 RMSNorm 融合设计。
 - `docs/reference-execution.md`：参考执行器、Shape Guard 和数值差分。
+- `docs/triton-lowering.md`：Triton Lowering、调度实验和 GPU 性能结果。
 
 ## 当前边界
 
 ServeIR 能无 fallback 地导入当前 67 个 Decoder 计算操作。默认优化流水线删除 11 个
 导出期断言并融合两个 RMSNorm，将 IR 降至 44 个 Operation。参考执行器已在 FP32/FP16
-和多组动态 Shape 下验证优化前后误差为 0。Attention 尚未改写为显式 KV 状态操作，
-`serve.rms_norm` 也尚未 Lower 到 GPU Kernel。
+和多组动态 Shape 下验证优化前后误差为 0。`serve.rms_norm` 已 Lower 到 Triton，在
+Qwen Hidden Size 的测试矩阵上相比 Inductor 几何平均快 1.064×。Attention 尚未改写为
+显式 KV 状态操作。
