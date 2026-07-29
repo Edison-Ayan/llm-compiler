@@ -180,11 +180,53 @@ def benchmark_one(
     )
 
 
-def write_results(rows: list[BenchmarkRow], output: Path) -> None:
+def build_profile(
+    rows: list[BenchmarkRow],
+    *,
+    epsilon: float,
+    warmup_ms: int,
+    rep_ms: int,
+) -> dict:
+    device = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(device)
+    return {
+        "schema_version": 1,
+        "target": {
+            "device_name": torch.cuda.get_device_name(device),
+            "compute_capability": f"{major}.{minor}",
+            "torch_version": torch.__version__,
+            "triton_version": triton.__version__,
+        },
+        "benchmark": {
+            "epsilon": epsilon,
+            "warmup_ms": warmup_ms,
+            "rep_ms": rep_ms,
+            # 所有候选后端均已在计时前完成首次编译和预热。
+            "compile_time_included": False,
+        },
+        "results": [asdict(row) for row in rows],
+    }
+
+
+def write_results(
+    rows: list[BenchmarkRow],
+    output: Path,
+    *,
+    epsilon: float,
+    warmup_ms: int,
+    rep_ms: int,
+) -> None:
+    if not rows:
+        raise ValueError("至少需要一条 Benchmark 结果")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
         json.dumps(
-            [asdict(row) for row in rows],
+            build_profile(
+                rows,
+                epsilon=epsilon,
+                warmup_ms=warmup_ms,
+                rep_ms=rep_ms,
+            ),
             ensure_ascii=False,
             indent=2,
         )
@@ -248,7 +290,13 @@ def main() -> None:
                     f"speedup(exp)={row.triton_vs_expanded:5.2f}x "
                     f"max_abs={row.max_abs_error:.2e}"
                 )
-    write_results(results, args.out)
+    write_results(
+        results,
+        args.out,
+        epsilon=args.epsilon,
+        warmup_ms=args.warmup_ms,
+        rep_ms=args.rep_ms,
+    )
     print(f"结果：{args.out} 和 {args.out.with_suffix('.csv')}")
 
 

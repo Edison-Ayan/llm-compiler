@@ -1,4 +1,4 @@
-"""Milestone-1 frontend: capture a dynamic decoder graph with torch.export."""
+"""使用 torch.export 捕获动态 Decoder 图。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,12 @@ from pathlib import Path
 import torch
 
 from .graph_summary import summarize_exported_program
-from .model import DecoderConfig, TinyDecoderBlock, make_inputs
+from .model import (
+    DecoderConfig,
+    StatefulTinyDecoderBlock,
+    TinyDecoderBlock,
+    make_inputs,
+)
 
 
 def export_decoder(
@@ -19,13 +24,47 @@ def export_decoder(
     max_batch: int = 8,
     max_sequence: int = 128,
 ) -> torch.export.ExportedProgram:
-    """Export a decoder with shared symbolic batch and sequence dimensions."""
+    """导出共享 Batch 和 Sequence 符号维度的 Decoder。"""
 
     batch = torch.export.Dim("batch", min=1, max=max_batch)
     sequence = torch.export.Dim("sequence", min=1, max=max_sequence)
     dynamic_shapes = {
         "hidden_states": {0: batch, 1: sequence},
         "attention_mask": {0: batch, 2: sequence, 3: sequence},
+    }
+    return torch.export.export(
+        model.eval(),
+        example_inputs,
+        dynamic_shapes=dynamic_shapes,
+        strict=True,
+    )
+
+
+def export_stateful_decode(
+    model: StatefulTinyDecoderBlock,
+    example_inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    *,
+    max_batch: int = 8,
+    max_cache_length: int = 128,
+) -> torch.export.ExportedProgram:
+    """导出 Batch 和历史 KV 长度动态的单 Token Decode。"""
+
+    batch = torch.export.Dim("batch", min=1, max=max_batch)
+    past = torch.export.Dim(
+        "past_sequence",
+        min=1,
+        max=max_cache_length,
+    )
+    dynamic_shapes = {
+        "hidden_states": {0: batch},
+        "attention_mask": {0: batch, 3: past + 1},
+        "past_key": {0: batch, 2: past},
+        "past_value": {0: batch, 2: past},
     }
     return torch.export.export(
         model.eval(),
@@ -42,7 +81,7 @@ def verify_export(
     batch: int,
     sequence: int,
 ) -> float:
-    """Run a non-example shape and return the maximum absolute error."""
+    """运行非样例 Shape，并返回最大绝对误差。"""
 
     inputs = make_inputs(model.config, batch, sequence, seed=17)
     with torch.no_grad():
@@ -127,4 +166,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

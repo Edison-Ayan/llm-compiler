@@ -140,7 +140,7 @@ relative_l2_error = 0.0
 
 - 参考执行器只覆盖当前优化后 Decoder 使用的操作；
 - 只实现单函数、单 Block、无控制流执行；
-- `serve.kv.read/append` 尚未接入可执行 KV Runtime；
+- `serve.kv.read/append` 已在 Stateful Decode 里接入不可变 KV Runtime；当前仍使用
+  `torch.cat` 追加，尚未 Lower 到预分配或分页 Cache；
 - 当前结果来自 CPU PyTorch，不是 GPU Kernel；
 - 数值等价不能证明未来 Triton Lowering 也等价，Triton 仍需独立差分测试。
-

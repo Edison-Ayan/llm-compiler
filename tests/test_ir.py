@@ -21,7 +21,12 @@ from stateful_llm_compiler.ir import (
 class ServeIRTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tensor_type = TensorType(
-            (StaticDim(2), StaticDim(4), StaticDim(16)),
+            (
+                StaticDim(2),
+                StaticDim(2),
+                StaticDim(4),
+                StaticDim(16),
+            ),
             "f16",
             "cuda",
         )
@@ -117,7 +122,32 @@ class ServeIRTest(unittest.TestCase):
         ):
             verify_module(module)
 
+    def test_kv_verifier_rejects_wrong_head_count(self) -> None:
+        builder = IRBuilder()
+        state = builder.argument(self.kv_type, "state")
+        wrong_type = TensorType(
+            (
+                StaticDim(2),
+                StaticDim(4),
+                StaticDim(1),
+                StaticDim(16),
+            ),
+            "f16",
+            "cuda",
+        )
+        key = builder.argument(wrong_type, "key")
+        value = builder.argument(wrong_type, "value")
+        append = kv_append(builder, state, key, value)
+        module = Module(
+            [Function("wrong_heads", builder.block, [append.results[0]])]
+        )
+
+        with self.assertRaisesRegex(
+            VerificationError,
+            "KV Head 数量必须为 2",
+        ):
+            verify_module(module)
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -2,12 +2,18 @@
 
 面向动态、有状态 LLM Serving 工作负载的研究型编译器。
 
-当前已经完成两个里程碑：
+当前已经完成七个里程碑：
 
 1. 使用 `torch.export` 捕获带动态 Batch/序列长度的 Qwen 风格 Decoder；
-2. 将 Functional ATen 图导入自研 ServeIR，显式建模 SSA、动态类型和 KV 副作用。
+2. 将 Functional ATen 图导入自研 ServeIR，显式建模 SSA、动态类型和 KV 副作用；
+3. 实现 Use-Def、PassManager、导出断言清理和 RMSNorm 融合；
+4. 实现 ServeIR 参考执行器和动态 Shape 数值差分验证；
+5. 将 `serve.rms_norm` Lower 到 Triton 并完成 GPU 性能实验；
+6. 基于目标 GPU Profile 生成动态 Shape 多版本 Lowering 计划并在运行时分派；
+7. 导出 Stateful 单 Token Decode，把 Tensor KV Cache 改写为显式状态并完成
+   CPU/GPU 多轮差分验证。
 
-项目刻意保持 CPU 可运行。GPU 代码生成、Triton Lowering 和 MLIR 对接属于后续阶段。
+项目仍保持 CPU 可运行；GPU Profile、Triton Kernel 和运行时分派是可选能力。
 
 ## 运行前端导出
 
@@ -37,6 +43,48 @@ PYTHONPATH=src python -m stateful_llm_compiler.optimizer \
   --before-out artifacts/decoder.before.serveir \
   --out artifacts/decoder.optimized.serveir \
   --stats-out artifacts/optimization_stats.json
+```
+
+使用 GPU Profile 运行 Profile-Guided Lowering：
+
+```bash
+PYTHONPATH=src python -m stateful_llm_compiler.optimizer \
+  artifacts/decoder.pt2 \
+  --profile artifacts/rmsnorm_benchmark_v1.json \
+  --out artifacts/decoder.profile.optimized.serveir \
+  --stats-out artifacts/profile_optimization_stats.json
+```
+
+导出带动态 KV Cache 的单 Token Decode：
+
+```bash
+PYTHONPATH=src python -m stateful_llm_compiler.stateful_frontend \
+  --out artifacts/stateful_decode.json \
+  --graph-out artifacts/stateful_decode.txt \
+  --program-out artifacts/stateful_decode.pt2 \
+  --example-past-length 4 \
+  --max-cache-length 64
+```
+
+把 Tensor KV Cache 改写为显式 ServeIR 状态：
+
+```bash
+PYTHONPATH=src python -m stateful_llm_compiler.optimizer \
+  artifacts/stateful_decode.pt2 \
+  --stateful-decode \
+  --out artifacts/stateful_decode.optimized.serveir \
+  --stats-out artifacts/stateful_decode_stats.json
+```
+
+运行四轮 Stateful Decode 差分验证：
+
+```bash
+PYTHONPATH=src python -m stateful_llm_compiler.stateful_check \
+  artifacts/stateful_decode.pt2 \
+  --batch 3 \
+  --past-length 5 \
+  --steps 4 \
+  --out artifacts/stateful_differential_results.json
 ```
 
 验证优化后 ServeIR 与原始程序数值等价：
@@ -85,11 +133,14 @@ attention_mask: [batch, 1, sequence, sequence]
 - `docs/passes.md`：Use-Def、PassManager 和 RMSNorm 融合设计。
 - `docs/reference-execution.md`：参考执行器、Shape Guard 和数值差分。
 - `docs/triton-lowering.md`：Triton Lowering、调度实验和 GPU 性能结果。
+- `docs/profile-guided-lowering.md`：Target Profile、成本模型、动态分桶与运行时分派。
+- `docs/stateful-decode.md`：Stateful Decode、KV 状态改写、副作用和多轮验证。
 
 ## 当前边界
 
 ServeIR 能无 fallback 地导入当前 67 个 Decoder 计算操作。默认优化流水线删除 11 个
 导出期断言并融合两个 RMSNorm，将 IR 降至 44 个 Operation。参考执行器已在 FP32/FP16
-和多组动态 Shape 下验证优化前后误差为 0。`serve.rms_norm` 已 Lower 到 Triton，在
-Qwen Hidden Size 的测试矩阵上相比 Inductor 几何平均快 1.064×。Attention 尚未改写为
-显式 KV 状态操作。
+和多组动态 Shape 下验证优化前后误差为 0。`serve.rms_norm` 已支持 Triton、Inductor
+和 PyTorch Native 多后端选择；本机 Profile 证明最优后端会随 Shape 改变。单 Token
+Decode 已支持动态历史长度，并将 Tensor Cache 改写为带读写副作用的显式 KV 状态。
+当前 KV Append 仍通过 `torch.cat` 实现，尚未进入预分配或 Paged KV Cache 阶段。

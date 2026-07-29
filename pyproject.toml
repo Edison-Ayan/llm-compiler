@@ -14,9 +14,12 @@ gpu = ["triton>=3.3"]
 
 [project.scripts]
 stateful-llm-export = "stateful_llm_compiler.frontend:main"
+stateful-llm-export-decode = "stateful_llm_compiler.stateful_frontend:main"
 stateful-llm-import = "stateful_llm_compiler.importer:main"
 stateful-llm-opt = "stateful_llm_compiler.optimizer:main"
 stateful-llm-check = "stateful_llm_compiler.reference_check:main"
+stateful-llm-check-decode = "stateful_llm_compiler.stateful_check:main"
+stateful-llm-cost = "stateful_llm_compiler.cost_model:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

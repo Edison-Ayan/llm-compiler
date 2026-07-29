@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from .ir import (
     Function,
     IRType,
+    KVStateType,
     Module,
     ScalarType,
     StaticDim,
@@ -28,6 +29,58 @@ from .ir import (
 
 class ExecutionError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class KVCacheState:
+    """按 Layer Slot 保存 K/V Tensor 的不可变运行时状态。"""
+
+    keys: tuple[torch.Tensor, ...]
+    values: tuple[torch.Tensor, ...]
+    generation: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.keys or len(self.keys) != len(self.values):
+            raise ExecutionError("KV Cache 的 Key/Value Slot 数量必须相同且非空")
+        for key, value in zip(self.keys, self.values):
+            if key.shape != value.shape:
+                raise ExecutionError("同一 Slot 的 Key/Value Shape 必须一致")
+            if key.ndim != 4:
+                raise ExecutionError("KV Cache Tensor 必须是四维 B×H×S×D")
+
+    @classmethod
+    def from_tensors(
+        cls,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> "KVCacheState":
+        return cls((key,), (value,))
+
+    def read(self, slot: int) -> tuple[torch.Tensor, torch.Tensor]:
+        try:
+            return self.keys[slot], self.values[slot]
+        except IndexError as error:
+            raise ExecutionError(f"KV Cache 不存在 Slot {slot}") from error
+
+    def append(
+        self,
+        slot: int,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        axis: int = 2,
+    ) -> "KVCacheState":
+        past_key, past_value = self.read(slot)
+        _validate_kv_append_inputs(past_key, past_value, key, value, axis)
+        keys = list(self.keys)
+        values = list(self.values)
+        keys[slot] = torch.cat((past_key, key), dim=axis)
+        values[slot] = torch.cat((past_value, value), dim=axis)
+        return KVCacheState(
+            tuple(keys),
+            tuple(values),
+            generation=self.generation + 1,
+        )
 
 
 @dataclass
@@ -134,6 +187,16 @@ class ReferenceExecutor:
                 [environment[value.name] for value in operands],
                 attributes,
             )
+        if name == "serve.kv.append":
+            return self._serve_kv_append(
+                [environment[value.name] for value in operands],
+                attributes,
+            )
+        if name == "serve.kv.read":
+            return self._serve_kv_read(
+                [environment[value.name] for value in operands],
+                attributes,
+            )
         handler = self._handlers.get(name)
         if handler is None:
             raise ExecutionError(f"参考执行器尚不支持操作 {name}")
@@ -178,6 +241,40 @@ class ReferenceExecutor:
         torch_dtype = _DTYPES.get(output_dtype, tensor.dtype)
         return (normalized * weight.float()).to(torch_dtype)
 
+    @staticmethod
+    def _serve_kv_append(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> KVCacheState:
+        if len(operands) != 3:
+            raise ExecutionError("serve.kv.append 需要 state、key 和 value")
+        state, key, value = operands
+        if not isinstance(state, KVCacheState):
+            raise ExecutionError("serve.kv.append 的 state 类型非法")
+        if not isinstance(key, torch.Tensor) or not isinstance(
+            value,
+            torch.Tensor,
+        ):
+            raise ExecutionError("serve.kv.append 的 key/value 必须是 Tensor")
+        return state.append(
+            int(attributes.get("slot", 0)),
+            key,
+            value,
+            axis=int(attributes.get("axis", 2)),
+        )
+
+    @staticmethod
+    def _serve_kv_read(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if len(operands) != 1 or not isinstance(
+            operands[0],
+            KVCacheState,
+        ):
+            raise ExecutionError("serve.kv.read 需要一个 KVCacheState")
+        return operands[0].read(int(attributes.get("slot", 0)))
+
 
 def bind_exported_program_arguments(
     program: torch.export.ExportedProgram,
@@ -212,6 +309,44 @@ def bind_exported_program_arguments(
             f"收到 {len(positional)} 个用户输入，但只消费了 "
             f"{positional_index} 个"
         )
+    return arguments
+
+
+def bind_stateful_decode_arguments(
+    program: torch.export.ExportedProgram,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    state: KVCacheState,
+) -> list[Any]:
+    """绑定改写后的 Decode 参数，用一个状态替代两个 Tensor Cache 输入。"""
+
+    user_values = {
+        "hidden_states": hidden_states,
+        "attention_mask": attention_mask,
+    }
+    arguments = []
+    state_inserted = False
+    for spec in program.graph_signature.input_specs:
+        kind = spec.kind.name
+        name = spec.arg.name
+        if kind in {"PARAMETER", "BUFFER"}:
+            arguments.append(program.state_dict[spec.target])
+        elif kind == "CONSTANT_TENSOR":
+            arguments.append(program.constants[spec.target])
+        elif kind == "USER_INPUT":
+            if name == "past_key":
+                arguments.append(state)
+                state_inserted = True
+            elif name == "past_value":
+                continue
+            elif name in user_values:
+                arguments.append(user_values[name])
+            else:
+                raise ExecutionError(f"不支持的 Stateful Decode 输入 {name}")
+        else:
+            raise ExecutionError(f"暂不支持 Graph InputKind：{kind}")
+    if not state_inserted:
+        raise ExecutionError("导出程序没有 past_key 输入")
     return arguments
 
 
@@ -309,6 +444,9 @@ def _validate_runtime_value(
                     dimension, int(actual), symbols, context, index
                 )
         return
+    if isinstance(type_, KVStateType):
+        _validate_kv_state(value, type_, context)
+        return
     if isinstance(type_, TupleType):
         if not isinstance(value, (tuple, list)):
             raise ExecutionError(f"{context} 应为 Tuple")
@@ -331,6 +469,69 @@ def _validate_runtime_value(
             raise ExecutionError(f"{context} 应为整数标量")
         return
     raise ExecutionError(f"{context} 使用了无法执行的类型 {type_}")
+
+
+def _validate_kv_state(
+    value: Any,
+    type_: KVStateType,
+    context: str,
+) -> None:
+    if not isinstance(value, KVCacheState):
+        raise ExecutionError(f"{context} 应为 KVCacheState")
+    if len(value.keys) != type_.num_layers:
+        raise ExecutionError(
+            f"{context} 应包含 {type_.num_layers} 个 Layer Slot"
+        )
+    expected_dtype = _DTYPES.get(type_.dtype)
+    for slot, (key, cached_value) in enumerate(
+        zip(value.keys, value.values)
+    ):
+        if key.shape != cached_value.shape:
+            raise ExecutionError(f"{context} Slot {slot} 的 K/V Shape 不一致")
+        if key.ndim != 4:
+            raise ExecutionError(f"{context} Slot {slot} 必须是四维 Tensor")
+        if key.shape[1] != type_.num_kv_heads:
+            raise ExecutionError(
+                f"{context} Slot {slot} 的 KV Head 数量应为 "
+                f"{type_.num_kv_heads}"
+            )
+        if key.shape[3] != type_.head_dim:
+            raise ExecutionError(
+                f"{context} Slot {slot} 的 Head Dim 应为 {type_.head_dim}"
+            )
+        if key.dtype != cached_value.dtype:
+            raise ExecutionError(f"{context} Slot {slot} 的 K/V DType 不一致")
+        if expected_dtype is not None and key.dtype != expected_dtype:
+            raise ExecutionError(
+                f"{context} Slot {slot} DType 应为 {expected_dtype}"
+            )
+
+
+def _validate_kv_append_inputs(
+    past_key: torch.Tensor,
+    past_value: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    axis: int,
+) -> None:
+    if axis not in {2, -2}:
+        raise ExecutionError("KV Cache 当前只支持沿 Sequence 维追加")
+    if key.shape != value.shape:
+        raise ExecutionError("待追加的 Key/Value Shape 必须一致")
+    if key.ndim != 4 or past_key.ndim != 4:
+        raise ExecutionError("KV Cache Tensor 必须是四维 B×H×S×D")
+    if past_key.shape != past_value.shape:
+        raise ExecutionError("历史 Key/Value Shape 必须一致")
+    for dimension in (0, 1, 3):
+        if past_key.shape[dimension] != key.shape[dimension]:
+            raise ExecutionError(
+                f"KV Append 第 {dimension} 维不匹配："
+                f"{past_key.shape[dimension]} != {key.shape[dimension]}"
+            )
+    if past_key.dtype != key.dtype or past_value.dtype != value.dtype:
+        raise ExecutionError("KV Append 的历史和当前 DType 必须一致")
+    if past_key.device != key.device or past_value.device != value.device:
+        raise ExecutionError("KV Append 的历史和当前 Device 必须一致")
 
 
 def _bind_symbol(

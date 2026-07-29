@@ -279,6 +279,21 @@ def _verify_kv_operation(operation: Operation, errors: list[str]) -> None:
         errors.append(f"{operation.name} 缺少 read({resource}) 副作用")
 
     if operation.name == "serve.kv.append":
+        if len(operation.operands) != 3:
+            errors.append("serve.kv.append 必须接收 state、key 和 value")
+        else:
+            _verify_kv_tensor(
+                operation.operands[1].type,
+                operation.operands[0].type,
+                "serve.kv.append 的 key",
+                errors,
+            )
+            _verify_kv_tensor(
+                operation.operands[2].type,
+                operation.operands[0].type,
+                "serve.kv.append 的 value",
+                errors,
+            )
         if (EffectKind.WRITE, resource) not in effect_pairs:
             errors.append(f"serve.kv.append 缺少 write({resource}) 副作用")
         if (
@@ -286,6 +301,56 @@ def _verify_kv_operation(operation: Operation, errors: list[str]) -> None:
             or operation.results[0].type != operation.operands[0].type
         ):
             errors.append("serve.kv.append 必须返回同类型的新 KV 状态")
+    elif operation.name == "serve.kv.read":
+        if len(operation.results) != 2:
+            errors.append("serve.kv.read 必须返回 key 和 value")
+        else:
+            _verify_kv_tensor(
+                operation.results[0].type,
+                operation.operands[0].type,
+                "serve.kv.read 的 key",
+                errors,
+            )
+            _verify_kv_tensor(
+                operation.results[1].type,
+                operation.operands[0].type,
+                "serve.kv.read 的 value",
+                errors,
+            )
+
+
+def _verify_kv_tensor(
+    tensor_type: IRType,
+    state_type: KVStateType,
+    context: str,
+    errors: list[str],
+) -> None:
+    if not isinstance(tensor_type, TensorType):
+        errors.append(f"{context} 必须是 TensorType")
+        return
+    if len(tensor_type.shape) != 4:
+        errors.append(f"{context} 必须是四维 B×H×S×D")
+        return
+    heads = tensor_type.shape[1]
+    head_dim = tensor_type.shape[3]
+    if (
+        not isinstance(heads, StaticDim)
+        or heads.value != state_type.num_kv_heads
+    ):
+        errors.append(
+            f"{context} 的 KV Head 数量必须为 {state_type.num_kv_heads}"
+        )
+    if (
+        not isinstance(head_dim, StaticDim)
+        or head_dim.value != state_type.head_dim
+    ):
+        errors.append(
+            f"{context} 的 Head Dim 必须为 {state_type.head_dim}"
+        )
+    if tensor_type.dtype != state_type.dtype:
+        errors.append(
+            f"{context} 的 DType 必须为 {state_type.dtype}"
+        )
 
 
 def _attribute_ssa_references(value: Any) -> list[str]:

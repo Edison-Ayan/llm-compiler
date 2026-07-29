@@ -9,19 +9,32 @@ from pathlib import Path
 
 import torch
 
+from .cost_model import RMSNormCostModel
 from .importer import import_exported_program
 from .ir import format_module
 from .pass_manager import PassManager
-from .passes import FuseRMSNormPass, RemoveExportAssertionsPass
+from .passes import (
+    FuseRMSNormPass,
+    MaterializeKVStatePass,
+    RemoveExportAssertionsPass,
+    SelectRMSNormLoweringPass,
+)
 
 
-def default_pass_manager() -> PassManager:
-    return PassManager(
-        [
-            RemoveExportAssertionsPass(),
-            FuseRMSNormPass(),
-        ]
-    )
+def default_pass_manager(
+    cost_model: RMSNormCostModel | None = None,
+    *,
+    stateful_decode: bool = False,
+) -> PassManager:
+    passes = [
+        RemoveExportAssertionsPass(),
+        FuseRMSNormPass(),
+    ]
+    if stateful_decode:
+        passes.append(MaterializeKVStatePass())
+    if cost_model is not None:
+        passes.append(SelectRMSNormLoweringPass(cost_model))
+    return PassManager(passes)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,6 +45,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--before-out", type=Path)
     parser.add_argument("--stats-out", type=Path)
+    parser.add_argument(
+        "--profile",
+        type=Path,
+        help="RMSNorm GPU Benchmark 生成的 Profile JSON",
+    )
+    parser.add_argument(
+        "--stateful-decode",
+        action="store_true",
+        help="把 Tensor KV Cache 改写为显式 ServeIR 状态",
+    )
     return parser
 
 
@@ -40,7 +63,13 @@ def main() -> None:
     exported = torch.export.load(args.program)
     module = import_exported_program(exported)
     before = format_module(module)
-    results = default_pass_manager().run(module)
+    cost_model = (
+        RMSNormCostModel.load(args.profile) if args.profile else None
+    )
+    results = default_pass_manager(
+        cost_model,
+        stateful_decode=args.stateful_decode,
+    ).run(module)
     after = format_module(module)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -71,4 +100,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

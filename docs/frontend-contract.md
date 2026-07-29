@@ -63,11 +63,10 @@ matmul, softmax, sym_size
 Unsupported operators remain explicit external calls. This avoids making the
 first importer depend on a complete ATen lowering.
 
-## Deferred state semantics
+## Stateful Decode extension
 
-This milestone is pure: keys and values are local results of the current
-forward. Milestone 2 adds state explicitly rather than hiding mutation behind a
-custom operator:
+The original frontend remains a pure Prefill-style fixture. The Stateful Decode
+extension now exports tensor-form past key/value inputs and rewrites them into:
 
 ```text
 !serve.kv_state
@@ -75,7 +74,7 @@ serve.kv.read
 serve.kv.append
 ```
 
-Those operations will carry read/write/alias effects. The existing pure graph
-will become the computation region inside `serve.prefill` before decode and
-prefix-cache behavior are added.
-
+These operations carry explicit read/write effects. See
+`docs/stateful-decode.md` for the dynamic cache-length contract, state rewrite,
+runtime semantics and current limitations. Paged allocation and prefix-cache
+behavior remain future work.
