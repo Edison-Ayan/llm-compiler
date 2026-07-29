@@ -1,0 +1,350 @@
+"""ServeIR 的核心数据结构。
+
+这一层只负责表达程序，不依赖 PyTorch、MLIR 或具体 GPU 后端。IR 采用 SSA 形式：
+每个 Value 只能定义一次，Operation 只能使用函数参数或此前已经定义的 Value。
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Iterable
+
+
+class IRType:
+    """所有 ServeIR 类型的基类。"""
+
+    def __str__(self) -> str:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class StaticDim:
+    value: int
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+
+@dataclass(frozen=True)
+class SymbolicDim:
+    name: str
+    bounds: str | None = None
+
+    def __str__(self) -> str:
+        if self.bounds:
+            return f"{self.name}<{self.bounds}>"
+        return self.name
+
+
+Dimension = StaticDim | SymbolicDim
+
+
+@dataclass(frozen=True)
+class TensorType(IRType):
+    shape: tuple[Dimension, ...]
+    dtype: str
+    device: str = "cpu"
+
+    def __str__(self) -> str:
+        dims = "x".join(str(dim) for dim in self.shape)
+        return f"tensor<{dims}x{self.dtype}, {self.device}>"
+
+
+@dataclass(frozen=True)
+class ScalarType(IRType):
+    dtype: str
+
+    def __str__(self) -> str:
+        return self.dtype
+
+
+@dataclass(frozen=True)
+class TupleType(IRType):
+    elements: tuple[IRType, ...]
+
+    def __str__(self) -> str:
+        return "tuple<" + ", ".join(str(item) for item in self.elements) + ">"
+
+
+@dataclass(frozen=True)
+class UnknownType(IRType):
+    reason: str = "unknown"
+
+    def __str__(self) -> str:
+        return f"!serve.unknown<{self.reason}>"
+
+
+@dataclass(frozen=True)
+class KVStateType(IRType):
+    """跨推理迭代存活的 KV Cache 状态句柄。"""
+
+    dtype: str
+    num_layers: int
+    num_kv_heads: int
+    head_dim: int
+    layout: str = "blocked"
+    resource: str = "kv"
+
+    def __str__(self) -> str:
+        return (
+            "!serve.kv_state<"
+            f"{self.dtype}, layers={self.num_layers}, "
+            f"heads={self.num_kv_heads}, head_dim={self.head_dim}, "
+            f"layout={self.layout}, resource={self.resource}>"
+        )
+
+
+class EffectKind(str, Enum):
+    READ = "read"
+    WRITE = "write"
+    ALLOCATE = "allocate"
+    FREE = "free"
+
+
+@dataclass(frozen=True)
+class Effect:
+    """Operation 对某个逻辑资源产生的副作用。"""
+
+    kind: EffectKind
+    resource: str
+
+    def __str__(self) -> str:
+        return f"{self.kind.value}({self.resource})"
+
+
+@dataclass(eq=False)
+class Value:
+    name: str
+    type: IRType
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclass
+class Operation:
+    name: str
+    operands: list[Value]
+    results: list[Value]
+    attributes: dict[str, Any] = field(default_factory=dict)
+    effects: tuple[Effect, ...] = ()
+
+
+@dataclass
+class Block:
+    arguments: list[Value] = field(default_factory=list)
+    operations: list[Operation] = field(default_factory=list)
+
+
+@dataclass
+class Function:
+    name: str
+    block: Block
+    returns: list[Value]
+
+
+@dataclass
+class Module:
+    functions: list[Function] = field(default_factory=list)
+
+
+class IRBuilder:
+    """集中创建 SSA Value，避免调用方手工维护唯一编号。"""
+
+    def __init__(self, block: Block | None = None) -> None:
+        self.block = block or Block()
+        self._next_value = 0
+        self._used_names: set[str] = set()
+
+    def argument(self, type_: IRType, hint: str = "arg") -> Value:
+        name = self._unique_name(f"%{hint}")
+        value = Value(name, type_)
+        self.block.arguments.append(value)
+        return value
+
+    def emit(
+        self,
+        name: str,
+        operands: Iterable[Value],
+        result_types: Iterable[IRType],
+        *,
+        attributes: dict[str, Any] | None = None,
+        effects: Iterable[Effect] = (),
+    ) -> Operation:
+        results = [
+            Value(self._unique_name(f"%v{self._next_id()}"), type_)
+            for type_ in result_types
+        ]
+        operation = Operation(
+            name=name,
+            operands=list(operands),
+            results=results,
+            attributes=dict(attributes or {}),
+            effects=tuple(effects),
+        )
+        self.block.operations.append(operation)
+        return operation
+
+    def _next_id(self) -> int:
+        value = self._next_value
+        self._next_value += 1
+        return value
+
+    def _unique_name(self, base: str) -> str:
+        if base not in self._used_names:
+            self._used_names.add(base)
+            return base
+        index = 1
+        while f"{base}_{index}" in self._used_names:
+            index += 1
+        name = f"{base}_{index}"
+        self._used_names.add(name)
+        return name
+
+
+class VerificationError(ValueError):
+    def __init__(self, errors: list[str]) -> None:
+        super().__init__("\n".join(errors))
+        self.errors = errors
+
+
+def verify_module(module: Module) -> None:
+    """验证 SSA 支配关系、唯一性以及 KV 操作的副作用契约。"""
+
+    errors: list[str] = []
+    function_names: set[str] = set()
+    for function in module.functions:
+        if function.name in function_names:
+            errors.append(f"函数重复定义：@{function.name}")
+        function_names.add(function.name)
+        _verify_function(function, errors)
+    if errors:
+        raise VerificationError(errors)
+
+
+def _verify_function(function: Function, errors: list[str]) -> None:
+    defined: set[Value] = set()
+    names: set[str] = set()
+
+    for argument in function.block.arguments:
+        if argument.name in names:
+            errors.append(f"@{function.name} 参数名称重复：{argument.name}")
+        names.add(argument.name)
+        defined.add(argument)
+
+    for index, operation in enumerate(function.block.operations):
+        for operand in operation.operands:
+            if operand not in defined:
+                errors.append(
+                    f"@{function.name} 第 {index} 个操作 {operation.name} "
+                    f"使用了尚未定义的值 {operand.name}"
+                )
+        operand_names = {operand.name for operand in operation.operands}
+        for reference in _attribute_ssa_references(operation.attributes):
+            if reference not in operand_names:
+                errors.append(
+                    f"@{function.name} 第 {index} 个操作 {operation.name} "
+                    f"的 Attribute 引用了非操作数 {reference}"
+                )
+        for result in operation.results:
+            if result.name in names:
+                errors.append(
+                    f"@{function.name} SSA 名称重复：{result.name}"
+                )
+            names.add(result.name)
+            defined.add(result)
+        _verify_kv_operation(operation, errors)
+
+    for returned in function.returns:
+        if returned not in defined:
+            errors.append(
+                f"@{function.name} 返回了尚未定义的值 {returned.name}"
+            )
+
+
+def _verify_kv_operation(operation: Operation, errors: list[str]) -> None:
+    if operation.name not in {"serve.kv.read", "serve.kv.append"}:
+        return
+    if not operation.operands or not isinstance(
+        operation.operands[0].type, KVStateType
+    ):
+        errors.append(f"{operation.name} 的第一个操作数必须是 KVStateType")
+        return
+
+    resource = operation.operands[0].type.resource
+    effect_pairs = {(effect.kind, effect.resource) for effect in operation.effects}
+    if (EffectKind.READ, resource) not in effect_pairs:
+        errors.append(f"{operation.name} 缺少 read({resource}) 副作用")
+
+    if operation.name == "serve.kv.append":
+        if (EffectKind.WRITE, resource) not in effect_pairs:
+            errors.append(f"serve.kv.append 缺少 write({resource}) 副作用")
+        if (
+            len(operation.results) != 1
+            or operation.results[0].type != operation.operands[0].type
+        ):
+            errors.append("serve.kv.append 必须返回同类型的新 KV 状态")
+
+
+def _attribute_ssa_references(value: Any) -> list[str]:
+    """提取 FX 参数树 Attribute 中的 SSA 引用。"""
+
+    if isinstance(value, dict):
+        if set(value) == {"ssa"} and isinstance(value["ssa"], str):
+            return [value["ssa"]]
+        references = []
+        for item in value.values():
+            references.extend(_attribute_ssa_references(item))
+        return references
+    if isinstance(value, (list, tuple)):
+        references = []
+        for item in value:
+            references.extend(_attribute_ssa_references(item))
+        return references
+    return []
+
+
+def format_module(module: Module) -> str:
+    """输出便于阅读和做快照测试的 MLIR 风格文本。"""
+
+    lines = ["module {"]
+    for function in module.functions:
+        args = ", ".join(
+            f"{arg.name}: {arg.type}" for arg in function.block.arguments
+        )
+        result_types = ", ".join(str(value.type) for value in function.returns)
+        lines.append(f"  func @{function.name}({args}) -> ({result_types}) {{")
+        for operation in function.block.operations:
+            results = ", ".join(result.name for result in operation.results)
+            assignment = f"{results} = " if results else ""
+            operands = ", ".join(value.name for value in operation.operands)
+            attrs = ""
+            if operation.attributes:
+                attrs = " " + json.dumps(
+                    operation.attributes,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            effects = ""
+            if operation.effects:
+                effects = " effects[" + ", ".join(
+                    str(effect) for effect in operation.effects
+                ) + "]"
+            operand_types = ", ".join(
+                str(value.type) for value in operation.operands
+            )
+            produced_types = ", ".join(
+                str(value.type) for value in operation.results
+            )
+            lines.append(
+                f'    {assignment}"{operation.name}"({operands})'
+                f"{attrs}{effects} : ({operand_types}) -> ({produced_types})"
+            )
+        returned = ", ".join(value.name for value in function.returns)
+        lines.append(f"    return {returned}")
+        lines.append("  }")
+    lines.append("}")
+    return "\n".join(lines)
