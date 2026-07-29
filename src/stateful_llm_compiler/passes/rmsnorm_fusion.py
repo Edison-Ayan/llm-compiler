@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..analysis import UseDefAnalysis
-from ..ir import Function, Module, Operation, Value
+from ..ir import Function, Module, Operation, TensorType, Value
 from ..pass_manager import CompilerPass, PassResult
 from ..rewriter import IRRewriter, RewriteError
 
@@ -45,6 +45,7 @@ class FuseRMSNormPass(CompilerPass):
                             "epsilon": match.epsilon,
                             "axis": -1,
                             "compute_dtype": "f32",
+                            "output_dtype": _result_dtype(match.output),
                         },
                         result_hint="rms_norm",
                     )
@@ -120,7 +121,13 @@ def _match_from_output_cast(
     )
     if input_cast_1 is None:
         return None
-    if input_cast_2.operands[0] is not input_cast_1.results[0]:
+    # FP32 导出可能保留连续两次 cast，FP16 导出则让两个 cast 直接共享原输入。
+    # 两种形式都表示同一个 RMSNorm 输入。
+    same_cast_chain = input_cast_2.operands[0] is input_cast_1.results[0]
+    same_original_input = (
+        input_cast_2.operands[0] is input_cast_1.operands[0]
+    )
+    if not same_cast_chain and not same_original_input:
         return None
 
     power_args = _positional_args(power)
@@ -207,3 +214,9 @@ def _positional_args(operation: Operation) -> list[Any]:
         return []
     values = arguments.get("tuple", [])
     return values if isinstance(values, list) else []
+
+
+def _result_dtype(value: Value) -> str:
+    if isinstance(value.type, TensorType):
+        return value.type.dtype
+    return "f32"

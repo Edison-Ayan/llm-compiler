@@ -39,6 +39,15 @@ PYTHONPATH=src python -m stateful_llm_compiler.optimizer \
   --stats-out artifacts/optimization_stats.json
 ```
 
+验证优化后 ServeIR 与原始程序数值等价：
+
+```bash
+PYTHONPATH=src python -m stateful_llm_compiler.reference_check \
+  artifacts/decoder.pt2 \
+  --shapes 1x1,2x8,3x13,4x17,8x32 \
+  --out artifacts/differential_results.json
+```
+
 运行测试：
 
 ```bash
@@ -63,9 +72,11 @@ attention_mask: [batch, 1, sequence, sequence]
 - `docs/frontend-contract.md`：前端输入和正确性契约；
 - `docs/serveir.md`：ServeIR、SSA 和 KV 副作用设计。
 - `docs/passes.md`：Use-Def、PassManager 和 RMSNorm 融合设计。
+- `docs/reference-execution.md`：参考执行器、Shape Guard 和数值差分。
 
 ## 当前边界
 
 ServeIR 能无 fallback 地导入当前 67 个 Decoder 计算操作。默认优化流水线删除 11 个
-导出期断言并融合两个 RMSNorm，将 IR 降至 44 个 Operation。Attention 尚未改写为显式
-KV 状态操作，`serve.rms_norm` 也尚未 Lower 到可执行 Kernel。
+导出期断言并融合两个 RMSNorm，将 IR 降至 44 个 Operation。参考执行器已在 FP32/FP16
+和多组动态 Shape 下验证优化前后误差为 0。Attention 尚未改写为显式 KV 状态操作，
+`serve.rms_norm` 也尚未 Lower 到 GPU Kernel。

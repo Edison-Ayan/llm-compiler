@@ -13,6 +13,7 @@ dependencies = ["torch>=2.8"]
 stateful-llm-export = "stateful_llm_compiler.frontend:main"
 stateful-llm-import = "stateful_llm_compiler.importer:main"
 stateful-llm-opt = "stateful_llm_compiler.optimizer:main"
+stateful-llm-check = "stateful_llm_compiler.reference_check:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

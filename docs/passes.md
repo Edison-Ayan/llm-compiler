@@ -116,8 +116,9 @@ weight_cast ──────────────────────�
 总计减少 23 个，下降 34.3%
 ```
 
-这里的 Operation 减少表示 IR 抽象层次提高，并不等价于运行时间提升。只有
-`serve.rms_norm` Lower 到实际融合 Kernel 后，才能评测 Kernel 数量和性能收益。
+这里的 Operation 减少表示 IR 抽象层次提高，并不等价于运行时间提升。参考执行器已经
+验证融合前后数值等价；只有 `serve.rms_norm` Lower 到实际融合 Kernel 后，才能评测
+Kernel 数量和性能收益。
 
 ## 负例与幂等性
 
@@ -132,7 +133,6 @@ weight_cast ──────────────────────�
 
 - 只识别当前 Qwen 风格 RMSNorm 展开形式；
 - 尚未支持 Pattern Benefit 和多个 Pattern 的优先级；
-- 尚未执行融合 IR，因此没有数值等价性测试；
+- 参考执行器已支持当前融合 IR，但不是高性能后端；
 - 尚未 Lower 到 Triton；
 - 尚未实现通用 DCE 和 Cast Canonicalization。
-
