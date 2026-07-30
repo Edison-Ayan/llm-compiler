@@ -11,6 +11,7 @@ import torch
 
 from .execution import (
     KVCacheState,
+    PreallocatedKVCacheState,
     ReferenceExecutor,
     bind_stateful_decode_arguments,
 )
@@ -38,12 +39,18 @@ def run_stateful_differential(
     past_length: int,
     steps: int,
     seed: int = 0,
+    preallocate_kv: bool = False,
+    kv_capacity: int | None = None,
 ) -> list[StatefulDifferentialRow]:
     module = import_exported_program(
         program,
         function_name="decode",
     )
-    default_pass_manager(stateful_decode=True).run(module)
+    default_pass_manager(
+        stateful_decode=True,
+        preallocate_kv=preallocate_kv,
+        kv_capacity=kv_capacity,
+    ).run(module)
     function = module.functions[0]
     state_argument = next(
         argument
@@ -80,13 +87,24 @@ def run_stateful_differential(
         generator=generator,
         dtype=dtype,
     )
-    state = KVCacheState.from_tensors(key, value)
+    if preallocate_kv:
+        capacity = state_type.capacity
+        if capacity is None:
+            raise TypeError("Bufferized KVState 缺少 Capacity")
+        state = PreallocatedKVCacheState.from_tensors(
+            key,
+            value,
+            capacity=capacity,
+        )
+    else:
+        state = KVCacheState.from_tensors(key, value)
     executor = ReferenceExecutor()
     rows = []
 
     with torch.no_grad():
         for step in range(steps):
-            cache_before = state.keys[0].shape[2]
+            logical_key, logical_value = state.read(0)
+            cache_before = logical_key.shape[2]
             hidden = torch.randn(
                 batch,
                 1,
@@ -104,7 +122,8 @@ def run_stateful_differential(
             expected = program.module()(
                 hidden,
                 mask,
-                *state.read(0),
+                logical_key,
+                logical_value,
             )
             result = executor.run(
                 module,
@@ -116,19 +135,20 @@ def run_stateful_differential(
                 ),
             )
             output, state = result.outputs
+            actual_key, actual_value = state.read(0)
             rows.append(
                 StatefulDifferentialRow(
                     step=step,
                     cache_length_before=cache_before,
-                    cache_length_after=state.keys[0].shape[2],
+                    cache_length_after=actual_key.shape[2],
                     state_generation=state.generation,
                     output_max_abs_error=_max_abs(output, expected[0]),
                     key_max_abs_error=_max_abs(
-                        state.keys[0],
+                        actual_key,
                         expected[1],
                     ),
                     value_max_abs_error=_max_abs(
-                        state.values[0],
+                        actual_value,
                         expected[2],
                     ),
                     operations=len(result.executed_operations),
@@ -162,6 +182,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--past-length", type=int, default=4)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--preallocate-kv",
+        action="store_true",
+        help="验证预分配 KV Bufferization 路径",
+    )
+    parser.add_argument("--kv-capacity", type=int)
     parser.add_argument("--out", type=Path)
     return parser
 
@@ -175,6 +201,8 @@ def main() -> None:
         past_length=args.past_length,
         steps=args.steps,
         seed=args.seed,
+        preallocate_kv=args.preallocate_kv,
+        kv_capacity=args.kv_capacity,
     )
     for row in rows:
         print(

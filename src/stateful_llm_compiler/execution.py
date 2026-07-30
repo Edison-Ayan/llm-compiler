@@ -83,6 +83,191 @@ class KVCacheState:
         )
 
 
+@dataclass(frozen=True)
+class PreallocatedKVCacheState:
+    """共享物理 Buffer、用独立 Length 保持逻辑 SSA 版本的 KV 状态。"""
+
+    keys: tuple[torch.Tensor, ...]
+    values: tuple[torch.Tensor, ...]
+    lengths: tuple[torch.Tensor, ...]
+    capacity: int
+    generation: int = 0
+
+    def __post_init__(self) -> None:
+        if self.capacity <= 0:
+            raise ExecutionError("预分配 KV Capacity 必须为正数")
+        if (
+            not self.keys
+            or len(self.keys) != len(self.values)
+            or len(self.keys) != len(self.lengths)
+        ):
+            raise ExecutionError("预分配 KV 的 K/V/Length Slot 数量必须一致")
+        for key, value, lengths in zip(
+            self.keys,
+            self.values,
+            self.lengths,
+        ):
+            if key.shape != value.shape or key.ndim != 4:
+                raise ExecutionError(
+                    "预分配 KV Buffer 必须是相同 Shape 的 B×C×H×D"
+                )
+            if key.shape[1] != self.capacity:
+                raise ExecutionError("KV Buffer 第二维必须等于 Capacity")
+            if lengths.shape != (key.shape[0],):
+                raise ExecutionError("KV Length 必须是一维 Batch Tensor")
+            if lengths.dtype != torch.int64:
+                raise ExecutionError("KV Length DType 必须是 i64")
+
+    @classmethod
+    def from_tensors(
+        cls,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        capacity: int,
+    ) -> "PreallocatedKVCacheState":
+        if key.shape != value.shape or key.ndim != 4:
+            raise ExecutionError("初始 KV Tensor 必须是相同 Shape 的 B×H×S×D")
+        batch, heads, sequence, head_dim = key.shape
+        if sequence > capacity:
+            raise ExecutionError(
+                f"初始 KV 长度 {sequence} 超过 Capacity {capacity}"
+            )
+        key_buffer = torch.zeros(
+            batch,
+            capacity,
+            heads,
+            head_dim,
+            device=key.device,
+            dtype=key.dtype,
+        )
+        value_buffer = torch.zeros_like(key_buffer)
+        key_buffer[:, :sequence].copy_(key.transpose(1, 2))
+        value_buffer[:, :sequence].copy_(value.transpose(1, 2))
+        lengths = torch.full(
+            (batch,),
+            sequence,
+            device=key.device,
+            dtype=torch.int64,
+        )
+        return cls(
+            (key_buffer,),
+            (value_buffer,),
+            (lengths,),
+            capacity,
+        )
+
+    def positions(self, slot: int) -> torch.Tensor:
+        try:
+            return self.lengths[slot]
+        except IndexError as error:
+            raise ExecutionError(f"KV Buffer 不存在 Slot {slot}") from error
+
+    def read(self, slot: int) -> tuple[torch.Tensor, torch.Tensor]:
+        try:
+            key = self.keys[slot]
+            value = self.values[slot]
+            lengths = self.lengths[slot]
+        except IndexError as error:
+            raise ExecutionError(f"KV Buffer 不存在 Slot {slot}") from error
+        used = int(lengths.max().item())
+        # 物理布局是 B×Capacity×H×D，ServeIR 逻辑布局仍是 B×H×S×D。
+        return (
+            key[:, :used].transpose(1, 2),
+            value[:, :used].transpose(1, 2),
+        )
+
+    def store(
+        self,
+        slot: int,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        writer=None,
+    ) -> "PreallocatedKVCacheState":
+        buffer_key, buffer_value = self._validate_store(
+            slot,
+            key,
+            value,
+            positions,
+        )
+        if writer is None:
+            native_kv_store(
+                buffer_key,
+                buffer_value,
+                key,
+                value,
+                positions,
+            )
+        else:
+            writer(
+                buffer_key,
+                buffer_value,
+                key,
+                value,
+                positions,
+            )
+        # Store 只修改当前逻辑长度之外的物理位置，旧状态的可见前缀保持不变。
+        return self
+
+    def advance(
+        self,
+        slot: int,
+        *,
+        delta: int,
+    ) -> "PreallocatedKVCacheState":
+        if delta <= 0:
+            raise ExecutionError("KV Advance Delta 必须为正数")
+        positions = self.positions(slot)
+        _ensure_kv_capacity(
+            positions + delta,
+            self.capacity,
+            f"KV Advance 超过 Capacity {self.capacity}",
+        )
+        lengths = list(self.lengths)
+        lengths[slot] = positions + delta
+        return PreallocatedKVCacheState(
+            self.keys,
+            self.values,
+            tuple(lengths),
+            self.capacity,
+            generation=self.generation + 1,
+        )
+
+    def _validate_store(
+        self,
+        slot: int,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        try:
+            buffer_key = self.keys[slot]
+            buffer_value = self.values[slot]
+        except IndexError as error:
+            raise ExecutionError(f"KV Buffer 不存在 Slot {slot}") from error
+        if key.shape != value.shape or key.ndim != 4:
+            raise ExecutionError("KV Store 的 K/V 必须是相同 Shape 的 B×H×T×D")
+        batch, heads, tokens, head_dim = key.shape
+        if (
+            batch != buffer_key.shape[0]
+            or heads != buffer_key.shape[2]
+            or head_dim != buffer_key.shape[3]
+        ):
+            raise ExecutionError("KV Store 的 Batch、Head 或 Head Dim 不匹配")
+        if positions.shape != (batch,) or positions.dtype != torch.int64:
+            raise ExecutionError("KV Store Positions 必须是一维 Batch i64 Tensor")
+        if positions.device != key.device:
+            raise ExecutionError("KV Store Positions 和 K/V 必须位于同一 Device")
+        _ensure_kv_capacity(
+            positions + tokens,
+            self.capacity,
+            f"KV Store 超过 Capacity {self.capacity}",
+        )
+        return buffer_key, buffer_value
+
+
 @dataclass
 class ExecutionResult:
     outputs: tuple[Any, ...]
@@ -197,6 +382,21 @@ class ReferenceExecutor:
                 [environment[value.name] for value in operands],
                 attributes,
             )
+        if name == "serve.kv.length":
+            return self._serve_kv_length(
+                [environment[value.name] for value in operands],
+                attributes,
+            )
+        if name == "serve.kv.store":
+            return self._serve_kv_store(
+                [environment[value.name] for value in operands],
+                attributes,
+            )
+        if name == "serve.kv.advance":
+            return self._serve_kv_advance(
+                [environment[value.name] for value in operands],
+                attributes,
+            )
         handler = self._handlers.get(name)
         if handler is None:
             raise ExecutionError(f"参考执行器尚不支持操作 {name}")
@@ -270,10 +470,61 @@ class ReferenceExecutor:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if len(operands) != 1 or not isinstance(
             operands[0],
-            KVCacheState,
+            (KVCacheState, PreallocatedKVCacheState),
         ):
-            raise ExecutionError("serve.kv.read 需要一个 KVCacheState")
+            raise ExecutionError("serve.kv.read 需要一个 KV Runtime State")
         return operands[0].read(int(attributes.get("slot", 0)))
+
+    @staticmethod
+    def _serve_kv_length(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> torch.Tensor:
+        if len(operands) != 1 or not isinstance(
+            operands[0],
+            PreallocatedKVCacheState,
+        ):
+            raise ExecutionError(
+                "serve.kv.length 需要 PreallocatedKVCacheState"
+            )
+        return operands[0].positions(int(attributes.get("slot", 0)))
+
+    @staticmethod
+    def _serve_kv_store(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> PreallocatedKVCacheState:
+        if len(operands) != 4 or not isinstance(
+            operands[0],
+            PreallocatedKVCacheState,
+        ):
+            raise ExecutionError(
+                "serve.kv.store 需要 state、key、value 和 positions"
+            )
+        state, key, value, positions = operands
+        return state.store(
+            int(attributes.get("slot", 0)),
+            key,
+            value,
+            positions,
+        )
+
+    @staticmethod
+    def _serve_kv_advance(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> PreallocatedKVCacheState:
+        if len(operands) != 1 or not isinstance(
+            operands[0],
+            PreallocatedKVCacheState,
+        ):
+            raise ExecutionError(
+                "serve.kv.advance 需要 PreallocatedKVCacheState"
+            )
+        return operands[0].advance(
+            int(attributes.get("slot", 0)),
+            delta=int(attributes.get("delta", 1)),
+        )
 
 
 def bind_exported_program_arguments(
@@ -316,7 +567,7 @@ def bind_stateful_decode_arguments(
     program: torch.export.ExportedProgram,
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
-    state: KVCacheState,
+    state: KVCacheState | PreallocatedKVCacheState,
 ) -> list[Any]:
     """绑定改写后的 Decode 参数，用一个状态替代两个 Tensor Cache 输入。"""
 
@@ -476,8 +727,14 @@ def _validate_kv_state(
     type_: KVStateType,
     context: str,
 ) -> None:
-    if not isinstance(value, KVCacheState):
-        raise ExecutionError(f"{context} 应为 KVCacheState")
+    if not isinstance(
+        value,
+        (KVCacheState, PreallocatedKVCacheState),
+    ):
+        raise ExecutionError(f"{context} 应为 KV Runtime State")
+    if isinstance(value, PreallocatedKVCacheState):
+        _validate_preallocated_kv_state(value, type_, context)
+        return
     if len(value.keys) != type_.num_layers:
         raise ExecutionError(
             f"{context} 应包含 {type_.num_layers} 个 Layer Slot"
@@ -505,6 +762,100 @@ def _validate_kv_state(
             raise ExecutionError(
                 f"{context} Slot {slot} DType 应为 {expected_dtype}"
             )
+
+
+def _validate_preallocated_kv_state(
+    value: PreallocatedKVCacheState,
+    type_: KVStateType,
+    context: str,
+) -> None:
+    if type_.layout != "contiguous_bshd":
+        raise ExecutionError(
+            f"{context} 的预分配 Runtime 不支持 Layout {type_.layout}"
+        )
+    if type_.capacity is not None and value.capacity != type_.capacity:
+        raise ExecutionError(
+            f"{context} Capacity 应为 {type_.capacity}，实际为 {value.capacity}"
+        )
+    if len(value.keys) != type_.num_layers:
+        raise ExecutionError(
+            f"{context} 应包含 {type_.num_layers} 个 Layer Slot"
+        )
+    expected_dtype = _DTYPES.get(type_.dtype)
+    for slot, (key, cached_value) in enumerate(
+        zip(value.keys, value.values)
+    ):
+        if key.shape != cached_value.shape or key.ndim != 4:
+            raise ExecutionError(
+                f"{context} Slot {slot} 必须是 B×Capacity×H×D"
+            )
+        if key.shape[2] != type_.num_kv_heads:
+            raise ExecutionError(
+                f"{context} Slot {slot} 的 KV Head 数量应为 "
+                f"{type_.num_kv_heads}"
+            )
+        if key.shape[3] != type_.head_dim:
+            raise ExecutionError(
+                f"{context} Slot {slot} 的 Head Dim 应为 {type_.head_dim}"
+            )
+        if expected_dtype is not None and key.dtype != expected_dtype:
+            raise ExecutionError(
+                f"{context} Slot {slot} DType 应为 {expected_dtype}"
+            )
+
+
+def native_kv_store(
+    buffer_key: torch.Tensor,
+    buffer_value: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    batch, _, tokens, _ = key.shape
+    rows = torch.arange(
+        batch,
+        device=positions.device,
+        dtype=torch.int64,
+    ).view(batch, 1)
+    offsets = torch.arange(
+        tokens,
+        device=positions.device,
+        dtype=torch.int64,
+    ).view(1, tokens)
+    indices = (
+        rows * buffer_key.shape[1]
+        + positions.view(batch, 1)
+        + offsets
+    ).reshape(-1)
+    source_key = key.transpose(1, 2).reshape(
+        batch * tokens,
+        key.shape[1],
+        key.shape[3],
+    )
+    source_value = value.transpose(1, 2).reshape_as(source_key)
+    buffer_key.view(
+        -1,
+        buffer_key.shape[2],
+        buffer_key.shape[3],
+    ).index_copy_(0, indices, source_key)
+    buffer_value.view(
+        -1,
+        buffer_value.shape[2],
+        buffer_value.shape[3],
+    ).index_copy_(0, indices, source_value)
+
+
+def _ensure_kv_capacity(
+    end_positions: torch.Tensor,
+    capacity: int,
+    message: str,
+) -> None:
+    condition = (end_positions <= capacity).all()
+    if end_positions.is_cuda:
+        # 异步设备断言不会为正常路径引入 `.item()` 的主机同步。
+        torch._assert_async(condition, message)
+    elif not bool(condition):
+        raise ExecutionError(message)
 
 
 def _validate_kv_append_inputs(

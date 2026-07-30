@@ -86,13 +86,20 @@ class KVStateType(IRType):
     head_dim: int
     layout: str = "blocked"
     resource: str = "kv"
+    capacity: int | None = None
 
     def __str__(self) -> str:
+        capacity = (
+            f", capacity={self.capacity}"
+            if self.capacity is not None
+            else ""
+        )
         return (
             "!serve.kv_state<"
             f"{self.dtype}, layers={self.num_layers}, "
             f"heads={self.num_kv_heads}, head_dim={self.head_dim}, "
-            f"layout={self.layout}, resource={self.resource}>"
+            f"layout={self.layout}, resource={self.resource}"
+            f"{capacity}>"
         )
 
 
@@ -265,7 +272,13 @@ def _verify_function(function: Function, errors: list[str]) -> None:
 
 
 def _verify_kv_operation(operation: Operation, errors: list[str]) -> None:
-    if operation.name not in {"serve.kv.read", "serve.kv.append"}:
+    if operation.name not in {
+        "serve.kv.read",
+        "serve.kv.append",
+        "serve.kv.length",
+        "serve.kv.store",
+        "serve.kv.advance",
+    }:
         return
     if not operation.operands or not isinstance(
         operation.operands[0].type, KVStateType
@@ -277,6 +290,13 @@ def _verify_kv_operation(operation: Operation, errors: list[str]) -> None:
     effect_pairs = {(effect.kind, effect.resource) for effect in operation.effects}
     if (EffectKind.READ, resource) not in effect_pairs:
         errors.append(f"{operation.name} 缺少 read({resource}) 副作用")
+
+    if operation.name in {
+        "serve.kv.append",
+        "serve.kv.store",
+        "serve.kv.advance",
+    } and (EffectKind.WRITE, resource) not in effect_pairs:
+        errors.append(f"{operation.name} 缺少 write({resource}) 副作用")
 
     if operation.name == "serve.kv.append":
         if len(operation.operands) != 3:
@@ -294,8 +314,6 @@ def _verify_kv_operation(operation: Operation, errors: list[str]) -> None:
                 "serve.kv.append 的 value",
                 errors,
             )
-        if (EffectKind.WRITE, resource) not in effect_pairs:
-            errors.append(f"serve.kv.append 缺少 write({resource}) 副作用")
         if (
             len(operation.results) != 1
             or operation.results[0].type != operation.operands[0].type
@@ -317,6 +335,47 @@ def _verify_kv_operation(operation: Operation, errors: list[str]) -> None:
                 "serve.kv.read 的 value",
                 errors,
             )
+    elif operation.name == "serve.kv.length":
+        if len(operation.operands) != 1 or len(operation.results) != 1:
+            errors.append("serve.kv.length 必须接收一个状态并返回位置 Tensor")
+        elif not _is_kv_positions_type(operation.results[0].type):
+            errors.append("serve.kv.length 必须返回一维 i64 位置 Tensor")
+    elif operation.name == "serve.kv.store":
+        if len(operation.operands) != 4:
+            errors.append(
+                "serve.kv.store 必须接收 state、key、value 和 positions"
+            )
+        else:
+            _verify_kv_tensor(
+                operation.operands[1].type,
+                operation.operands[0].type,
+                "serve.kv.store 的 key",
+                errors,
+            )
+            _verify_kv_tensor(
+                operation.operands[2].type,
+                operation.operands[0].type,
+                "serve.kv.store 的 value",
+                errors,
+            )
+            if not _is_kv_positions_type(operation.operands[3].type):
+                errors.append("serve.kv.store 的 positions 必须是一维 i64 Tensor")
+        if (
+            len(operation.results) != 1
+            or operation.results[0].type != operation.operands[0].type
+        ):
+            errors.append("serve.kv.store 必须返回同类型的别名状态")
+    elif operation.name == "serve.kv.advance":
+        delta = operation.attributes.get("delta", 1)
+        if not isinstance(delta, int) or delta <= 0:
+            errors.append("serve.kv.advance 的 delta 必须为正整数")
+        if len(operation.operands) != 1:
+            errors.append("serve.kv.advance 必须接收一个状态")
+        if (
+            len(operation.results) != 1
+            or operation.results[0].type != operation.operands[0].type
+        ):
+            errors.append("serve.kv.advance 必须返回同类型的新状态")
 
 
 def _verify_kv_tensor(
@@ -351,6 +410,14 @@ def _verify_kv_tensor(
         errors.append(
             f"{context} 的 DType 必须为 {state_type.dtype}"
         )
+
+
+def _is_kv_positions_type(type_: IRType) -> bool:
+    return (
+        isinstance(type_, TensorType)
+        and len(type_.shape) == 1
+        and type_.dtype == "i64"
+    )
 
 
 def _attribute_ssa_references(value: Any) -> list[str]:

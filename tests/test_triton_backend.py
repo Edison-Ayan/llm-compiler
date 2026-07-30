@@ -7,10 +7,12 @@ import torch
 
 from stateful_llm_compiler.backends import (
     TritonExecutor,
+    triton_kv_store,
     triton_rms_norm,
 )
 from stateful_llm_compiler.execution import (
     KVCacheState,
+    PreallocatedKVCacheState,
     bind_exported_program_arguments,
     bind_stateful_decode_arguments,
 )
@@ -273,6 +275,115 @@ class TritonRMSNormTest(unittest.TestCase):
             [item["backend"] for item in executor.lowering_trace],
             ["triton", "triton", "triton", "triton"],
         )
+
+    def test_bufferized_decode_runs_triton_kv_store_on_gpu(self) -> None:
+        torch.manual_seed(0)
+        config = DecoderConfig(
+            hidden_size=32,
+            num_heads=4,
+            num_kv_heads=2,
+            intermediate_size=64,
+        )
+        model = StatefulTinyDecoderBlock(config).eval().cuda()
+        example = tuple(
+            tensor.cuda()
+            for tensor in make_decode_inputs(config, 2, 4)
+        )
+        program = export_stateful_decode(
+            model,
+            example,
+            max_cache_length=64,
+        )
+        module = import_exported_program(
+            program,
+            function_name="decode",
+        )
+        default_pass_manager(preallocate_kv=True).run(module)
+        state = PreallocatedKVCacheState.from_tensors(
+            example[2],
+            example[3],
+            capacity=65,
+        )
+        pointers = (
+            state.keys[0].data_ptr(),
+            state.values[0].data_ptr(),
+        )
+        executor = TritonExecutor()
+
+        with torch.no_grad():
+            for _ in range(2):
+                hidden = torch.randn(2, 1, 32, device="cuda")
+                mask = torch.zeros(
+                    2,
+                    1,
+                    1,
+                    int(state.lengths[0].max()) + 1,
+                    device="cuda",
+                )
+                expected = program.module()(
+                    hidden,
+                    mask,
+                    *state.read(0),
+                )
+                actual, state = executor.run(
+                    module,
+                    bind_stateful_decode_arguments(
+                        program,
+                        hidden,
+                        mask,
+                        state,
+                    ),
+                ).outputs
+                torch.testing.assert_close(
+                    actual,
+                    expected[0],
+                    rtol=3e-5,
+                    atol=3e-5,
+                )
+                actual_key, actual_value = state.read(0)
+                torch.testing.assert_close(actual_key, expected[1])
+                torch.testing.assert_close(actual_value, expected[2])
+
+        self.assertEqual(state.lengths[0].tolist(), [6, 6])
+        self.assertEqual(
+            pointers,
+            (
+                state.keys[0].data_ptr(),
+                state.values[0].data_ptr(),
+            ),
+        )
+
+    def test_triton_kv_store_supports_per_batch_positions(self) -> None:
+        batch, capacity, heads, head_dim = 3, 16, 2, 8
+        key_buffer = torch.zeros(
+            batch,
+            capacity,
+            heads,
+            head_dim,
+            device="cuda",
+        )
+        value_buffer = torch.zeros_like(key_buffer)
+        key = torch.randn(batch, heads, 1, head_dim, device="cuda")
+        value = torch.randn_like(key)
+        positions = torch.tensor([1, 5, 9], device="cuda")
+
+        triton_kv_store(
+            key_buffer,
+            value_buffer,
+            key,
+            value,
+            positions,
+        )
+
+        for item, position in enumerate(positions.tolist()):
+            torch.testing.assert_close(
+                key_buffer[item, position],
+                key[item, :, 0],
+            )
+            torch.testing.assert_close(
+                value_buffer[item, position],
+                value[item, :, 0],
+            )
 
 
 if __name__ == "__main__":

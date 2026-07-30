@@ -7,6 +7,7 @@ import torch
 from stateful_llm_compiler.execution import (
     ExecutionError,
     KVCacheState,
+    PreallocatedKVCacheState,
     ReferenceExecutor,
     bind_stateful_decode_arguments,
 )
@@ -223,6 +224,129 @@ class KVStateCompilerTest(unittest.TestCase):
         self.assertEqual(state.generation, 4)
         self.assertEqual(original_key.shape[2], 3)
         self.assertEqual(len(result.executed_operations), 45)
+
+    def test_bufferization_generates_position_store_and_advance(self) -> None:
+        module = self.make_module()
+        results = default_pass_manager(preallocate_kv=True).run(module)
+        function = module.functions[0]
+        names = [
+            operation.name
+            for operation in function.block.operations
+        ]
+        state_type = function.block.arguments[-1].type
+
+        self.assertEqual(results[-1].statistics["bufferized"], 1)
+        self.assertNotIn("serve.kv.append", names)
+        self.assertEqual(names.count("serve.kv.length"), 1)
+        self.assertEqual(names.count("serve.kv.store"), 1)
+        self.assertEqual(names.count("serve.kv.advance"), 1)
+        self.assertEqual(len(names), 47)
+        self.assertIsInstance(state_type, KVStateType)
+        self.assertEqual(state_type.layout, "contiguous_bshd")
+        self.assertEqual(state_type.capacity, 65)
+        verify_module(module)
+
+    def test_preallocated_runtime_preserves_values_and_addresses(self) -> None:
+        module = self.make_module()
+        default_pass_manager(preallocate_kv=True).run(module)
+        executor = ReferenceExecutor()
+        _, _, past_key, past_value = make_decode_inputs(
+            self.config,
+            batch=2,
+            past_length=3,
+            seed=11,
+        )
+        state = PreallocatedKVCacheState.from_tensors(
+            past_key,
+            past_value,
+            capacity=65,
+        )
+        pointers = (
+            state.keys[0].data_ptr(),
+            state.values[0].data_ptr(),
+        )
+
+        with torch.no_grad():
+            for step in range(4):
+                hidden = torch.randn(
+                    2,
+                    1,
+                    self.config.hidden_size,
+                    generator=torch.Generator().manual_seed(200 + step),
+                )
+                mask = torch.zeros(
+                    2,
+                    1,
+                    1,
+                    int(state.lengths[0].max()) + 1,
+                )
+                expected = self.program.module()(
+                    hidden,
+                    mask,
+                    *state.read(0),
+                )
+                actual, state = executor.run(
+                    module,
+                    bind_stateful_decode_arguments(
+                        self.program,
+                        hidden,
+                        mask,
+                        state,
+                    ),
+                ).outputs
+                torch.testing.assert_close(actual, expected[0])
+                actual_key, actual_value = state.read(0)
+                torch.testing.assert_close(actual_key, expected[1])
+                torch.testing.assert_close(actual_value, expected[2])
+
+        self.assertEqual(state.lengths[0].tolist(), [7, 7])
+        self.assertEqual(state.generation, 4)
+        self.assertEqual(
+            pointers,
+            (
+                state.keys[0].data_ptr(),
+                state.values[0].data_ptr(),
+            ),
+        )
+
+    def test_preallocated_runtime_rejects_capacity_overflow(self) -> None:
+        _, _, key, value = make_decode_inputs(
+            self.config,
+            batch=2,
+            past_length=3,
+        )
+        state = PreallocatedKVCacheState.from_tensors(
+            key,
+            value,
+            capacity=3,
+        )
+        current = torch.randn(2, 2, 1, 8)
+
+        with self.assertRaisesRegex(ExecutionError, "超过 Capacity 3"):
+            state.store(
+                0,
+                current,
+                current,
+                state.positions(0),
+            )
+
+    def test_bufferized_pipeline_is_idempotent_and_can_override_capacity(
+        self,
+    ) -> None:
+        module = self.make_module()
+        manager = default_pass_manager(
+            preallocate_kv=True,
+            kv_capacity=128,
+        )
+        first = manager.run(module)
+        second = manager.run(module)
+        state_type = module.functions[0].block.arguments[-1].type
+
+        self.assertEqual(first[-1].statistics["bufferized"], 1)
+        self.assertTrue(all(not result.changed for result in second))
+        self.assertEqual(second[-1].statistics["bufferized"], 0)
+        self.assertIsInstance(state_type, KVStateType)
+        self.assertEqual(state_type.capacity, 128)
 
     def test_kv_runtime_rejects_incompatible_append(self) -> None:
         _, _, key, value = make_decode_inputs(

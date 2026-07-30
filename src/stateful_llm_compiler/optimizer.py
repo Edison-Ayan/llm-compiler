@@ -14,6 +14,7 @@ from .importer import import_exported_program
 from .ir import format_module
 from .pass_manager import PassManager
 from .passes import (
+    BufferizeKVCachePass,
     FuseRMSNormPass,
     MaterializeKVStatePass,
     RemoveExportAssertionsPass,
@@ -25,13 +26,17 @@ def default_pass_manager(
     cost_model: RMSNormCostModel | None = None,
     *,
     stateful_decode: bool = False,
+    preallocate_kv: bool = False,
+    kv_capacity: int | None = None,
 ) -> PassManager:
     passes = [
         RemoveExportAssertionsPass(),
         FuseRMSNormPass(),
     ]
-    if stateful_decode:
+    if stateful_decode or preallocate_kv:
         passes.append(MaterializeKVStatePass())
+    if preallocate_kv:
+        passes.append(BufferizeKVCachePass(capacity=kv_capacity))
     if cost_model is not None:
         passes.append(SelectRMSNormLoweringPass(cost_model))
     return PassManager(passes)
@@ -55,6 +60,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="把 Tensor KV Cache 改写为显式 ServeIR 状态",
     )
+    parser.add_argument(
+        "--preallocate-kv",
+        action="store_true",
+        help="把 KV Append Lower 成预分配 Buffer 的位置写入",
+    )
+    parser.add_argument(
+        "--kv-capacity",
+        type=int,
+        help="覆盖导出动态上界推导出的 KV Buffer Capacity",
+    )
     return parser
 
 
@@ -69,6 +84,8 @@ def main() -> None:
     results = default_pass_manager(
         cost_model,
         stateful_decode=args.stateful_decode,
+        preallocate_kv=args.preallocate_kv,
+        kv_capacity=args.kv_capacity,
     ).run(module)
     after = format_module(module)
 

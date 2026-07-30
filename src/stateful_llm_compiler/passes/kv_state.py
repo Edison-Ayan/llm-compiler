@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from ..analysis import UseDefAnalysis
 from ..ir import (
     Effect,
@@ -70,7 +72,10 @@ def _rewrite_function(function) -> bool | None:
     ):
         return None
 
-    state_type = _infer_state_type(past_key.type)
+    state_type = _infer_state_type(
+        past_key.type,
+        key_cat.results[0].type,
+    )
     if state_type is None:
         return None
 
@@ -207,7 +212,10 @@ def _other_operand(
     return candidates[0] if len(candidates) == 1 else None
 
 
-def _infer_state_type(tensor_type: TensorType) -> KVStateType | None:
+def _infer_state_type(
+    tensor_type: TensorType,
+    present_type,
+) -> KVStateType | None:
     if len(tensor_type.shape) != 4:
         return None
     heads = tensor_type.shape[1]
@@ -217,12 +225,28 @@ def _infer_state_type(tensor_type: TensorType) -> KVStateType | None:
         StaticDim,
     ):
         return None
+    capacity = None
+    if isinstance(present_type, TensorType):
+        sequence = present_type.shape[2]
+        if isinstance(sequence, StaticDim):
+            capacity = sequence.value
+        else:
+            bounds = getattr(sequence, "bounds", None)
+            if bounds:
+                match = re.fullmatch(
+                    r"VR\[-?\d+,\s*(-?\d+)\]",
+                    bounds,
+                )
+                if match is not None:
+                    capacity = int(match.group(1))
     return KVStateType(
         dtype=tensor_type.dtype,
         num_layers=1,
         num_kv_heads=heads.value,
         head_dim=head_dim.value,
+        layout="logical_bhsd",
         resource="kv.layer0",
+        capacity=capacity,
     )
 
 

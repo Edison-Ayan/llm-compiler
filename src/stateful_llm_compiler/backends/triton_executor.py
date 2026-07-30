@@ -8,7 +8,12 @@ import torch
 import torch.nn.functional as F
 
 from ..cost_model import resolve_lowering_plan
-from ..execution import ExecutionError, ReferenceExecutor
+from ..execution import (
+    ExecutionError,
+    PreallocatedKVCacheState,
+    ReferenceExecutor,
+)
+from .triton_kv import triton_kv_store
 from .triton_rmsnorm import triton_rms_norm
 
 
@@ -100,6 +105,27 @@ class TritonExecutor(ReferenceExecutor):
             )
         raise ExecutionError(
             f"不支持的 RMSNorm Lowering Backend：{decision.backend}"
+        )
+
+    @staticmethod
+    def _serve_kv_store(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> PreallocatedKVCacheState:
+        if len(operands) != 4 or not isinstance(
+            operands[0],
+            PreallocatedKVCacheState,
+        ):
+            raise ExecutionError(
+                "serve.kv.store 需要 state、key、value 和 positions"
+            )
+        state, key, value, positions = operands
+        return state.store(
+            int(attributes.get("slot", 0)),
+            key,
+            value,
+            positions,
+            writer=triton_kv_store,
         )
 
 

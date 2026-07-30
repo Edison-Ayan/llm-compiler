@@ -16,7 +16,8 @@ hidden_states + attention_mask + kv_state
     → output + next_kv_state
 ```
 
-这一步的重点是状态语义和正确性闭环，不是最终的 KV Cache 存储性能。
+这一步的重点是状态语义和正确性闭环。后续的 KV Bufferization 已在
+`docs/kv-bufferization.md` 中实现。
 
 ## PyTorch 前端契约
 
@@ -199,15 +200,13 @@ PYTHONPATH=src python -m stateful_llm_compiler.stateful_check \
 ## 当前边界
 
 - 当前只有一个 Decoder Layer 和一个 KV Slot；
-- Runtime 的 Append 仍使用 `torch.cat`，每轮会重新复制历史 Cache，语义正确但性能
-  不适合生产环境；
-- 还没有预分配连续 KV Buffer，也没有原地写入指定 Token 位置；
+- 高层 Reference Runtime 的 Append 仍保留 `torch.cat` 作为语义基线；
+- `BufferizeKVCachePass` 已能生成预分配连续 Buffer 和 Triton 位置写入；
 - 还没有 Paged KV Cache、Block Table、内存分配和回收；
 - 还没有 RoPE，因此 Cache 中保存的是未旋转模型产生的简单 K/V；
 - 只导出了单 Token Decode，Prefill 仍使用原来的无状态完整序列路径；
-- KV Read/Append 还没有 Triton Kernel，GPU 联合测试中它们使用 PyTorch Runtime；
+- KV Store 已有 Triton Kernel，但 Attention 尚未直接消费物理 Buffer；
 - 尚未实现多层状态的别名分析和跨 Layer 内存规划。
 
-下一阶段应该把语义正确的 `serve.kv.append` Lower 到预分配 Buffer 的位置写入，
-再扩展为分页 Cache。这会消除当前 `torch.cat` 的 O(历史长度) 数据复制。
-
+下一阶段应该把 Attention Lower 成直接读取预分配 Buffer 和 Lengths，再扩展为分页
+Cache，消除逻辑 KV Tensor View 和普通 Matmul 路径。
