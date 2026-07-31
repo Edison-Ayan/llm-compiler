@@ -61,11 +61,15 @@ Attention Mask 共享同一个序列长度符号。
 >
 ```
 
-第一版定义两个操作：
+当前状态相关操作：
 
 ```text
-serve.kv.read   effects[read(kv)]
-serve.kv.append effects[read(kv), write(kv)]
+serve.kv.read          effects[read(kv)]
+serve.kv.append        effects[read(kv), write(kv)]
+serve.kv.length        effects[read(kv)]
+serve.kv.store         effects[read(kv), write(kv)]
+serve.kv.advance       effects[read(kv), write(kv)]
+serve.decode_attention effects[read(kv)]
 ```
 
 `kv.append` 返回一个新的 SSA 状态值，但同时声明底层 KV 资源发生了写入。这样既能用
@@ -76,7 +80,10 @@ SSA 表达状态版本，又不会错误地把它当成纯函数并跨越其他 
 - 第一个操作数必须是 `KVStateType`；
 - `kv.read` 必须声明读效果；
 - `kv.append` 必须声明读写效果；
-- `kv.append` 必须返回同类型的新 KV 状态。
+- `kv.append/store/advance` 必须返回同类型的新 KV 状态；
+- `decode_attention` 必须接收连续物理 Layout 的状态、四维 Query 和 Mask；
+- Query Head 必须等于 KV Head 乘以 GQA Groups；
+- Attention 的 Scale、结果类型和只读副作用必须合法。
 
 ## ATen 导入
 
@@ -93,18 +100,18 @@ SSA 表达状态版本，又不会错误地把它当成纯函数并跨越其他 
 
 ```text
 9 个函数参数
-67 个 ServeIR 操作
+76 个 ServeIR 操作
 1 个返回值
 0 个 external fallback
 ```
 
 ## 当前限制
 
-- 当前导入的 Decoder 仍是纯计算图，尚未把 Attention 改写成显式 KV 操作；
 - `UnknownType` 仍用于无返回值的元数据断言；
 - 尚未实现 Region、控制流和多 Block；
-- 尚未实现 Alias Analysis；
-- 尚未实现任何优化 Pass 或代码生成。
+- Alias Analysis 当前只显式处理预分配 KV 状态的物理别名；
+- Stateful Decode 当前只覆盖单层、单 Token 和连续 KV Layout；
+- 尚未实现 Paged KV、Block Table 和全局显存规划。
 
 ## 优化 Pass
 
@@ -113,7 +120,12 @@ SSA 表达状态版本，又不会错误地把它当成纯函数并跨越其他 
 1. `RemoveExportAssertions`：删除只用于 Export Guard 的无结果元数据断言；
 2. `FuseRMSNorm`：把 `pow → mean → add → rsqrt → mul` 识别为
    `serve.rms_norm`；
-3. Use-Def Analysis、IR Rewriter 和逐 Pass 校验。
+3. `MaterializeKVState`：把 Tensor Cache 和 `cat` 改写为显式 KV 状态；
+4. `BufferizeKVCache`：把 Append Lower 成 Length、Store 和 Advance；
+5. `FuseDecodeAttention`：把 KV Read、GQA、Softmax 和 Matmul 融合为
+   `serve.decode_attention`；
+6. Use-Def Analysis、IR Rewriter、PassManager 和逐 Pass 校验；
+7. RMSNorm、KV Store、Decode Attention 的 Triton Lowering。
 
-详细设计和实验结果见 `docs/passes.md`。下一阶段需要为 `serve.rms_norm` 建立可执行
-Reference Lowering，再实现 Triton Lowering 和数值/性能对比。
+详细设计和实验结果见 `docs/passes.md`、`docs/kv-bufferization.md` 和
+`docs/decode-attention.md`。

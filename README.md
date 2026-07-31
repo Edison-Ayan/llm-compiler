@@ -2,7 +2,7 @@
 
 面向动态、有状态 LLM Serving 工作负载的研究型编译器。
 
-当前已经完成八个里程碑：
+当前已经完成九个里程碑：
 
 1. 使用 `torch.export` 捕获带动态 Batch/序列长度的 Qwen 风格 Decoder；
 2. 将 Functional ATen 图导入自研 ServeIR，显式建模 SSA、动态类型和 KV 副作用；
@@ -12,7 +12,9 @@
 6. 基于目标 GPU Profile 生成动态 Shape 多版本 Lowering 计划并在运行时分派；
 7. 导出 Stateful 单 Token Decode，把 Tensor KV Cache 改写为显式状态并完成
    CPU/GPU 多轮差分验证；
-8. 自动把逻辑 KV Append Bufferize 为预分配位置写入，并 Lower 到 Triton KV Store。
+8. 自动把逻辑 KV Append Bufferize 为预分配位置写入，并 Lower 到 Triton KV Store；
+9. 把 GQA Decode Attention 融合为 `serve.decode_attention`，通过 Online Softmax
+   Triton Kernel 直接消费物理 KV Buffer 和设备 Length。
 
 项目仍保持 CPU 可运行；GPU Profile、Triton Kernel 和运行时分派是可选能力。
 
@@ -126,6 +128,15 @@ PYTHONPATH=src python benchmarks/bench_rmsnorm.py \
   --out artifacts/rmsnorm_benchmark.json
 ```
 
+运行 Decode Attention GPU 基准：
+
+```bash
+PYTHONPATH=src python benchmarks/bench_decode_attention.py \
+  --batches 1,8 \
+  --lengths 64,256,1024 \
+  --out artifacts/decode_attention_benchmark.json
+```
+
 运行测试：
 
 ```bash
@@ -155,14 +166,18 @@ attention_mask: [batch, 1, sequence, sequence]
 - `docs/profile-guided-lowering.md`：Target Profile、成本模型、动态分桶与运行时分派。
 - `docs/stateful-decode.md`：Stateful Decode、KV 状态改写、副作用和多轮验证。
 - `docs/kv-bufferization.md`：KV Bufferization、物理 Layout、Triton Store 和性能结果。
+- `docs/decode-attention.md`：Attention IR 融合、Online Softmax Triton Lowering 和
+  GPU 性能结果。
 
 ## 当前边界
 
-ServeIR 能无 fallback 地导入当前 67 个 Decoder 计算操作。默认优化流水线删除 11 个
+在当前 PyTorch 2.8 环境中，ServeIR 能无 fallback 地导入 76 个 Decoder 操作。
+默认优化流水线删除 14 个
 导出期断言并融合两个 RMSNorm，将 IR 降至 44 个 Operation。参考执行器已在 FP32/FP16
 和多组动态 Shape 下验证优化前后误差为 0。`serve.rms_norm` 已支持 Triton、Inductor
 和 PyTorch Native 多后端选择；本机 Profile 证明最优后端会随 Shape 改变。单 Token
 Decode 已支持动态历史长度，并将 Tensor Cache 改写为带读写副作用的显式 KV 状态。
 KV Append 已能自动 Bufferize 为预分配位置写入；RTX 4060 上 Triton Store 相比
-`torch.cat` 九组配置几何平均加速 7.064×。Attention 尚未直接消费物理 Buffer，
-Paged KV Cache 和 Block Table 仍属于后续阶段。
+`torch.cat` 九组配置几何平均加速 7.064×。Decode Attention 已直接消费物理 KV
+Buffer，六组配置相比原展开路径几何平均加速 1.545×；当前仍只支持单 Token、连续
+Layout，Paged KV Cache、Block Table 和长上下文 Split-Sequence 属于后续阶段。

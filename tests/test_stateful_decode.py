@@ -235,12 +235,15 @@ class KVStateCompilerTest(unittest.TestCase):
         ]
         state_type = function.block.arguments[-1].type
 
-        self.assertEqual(results[-1].statistics["bufferized"], 1)
+        self.assertEqual(results[-2].statistics["bufferized"], 1)
+        self.assertEqual(results[-1].statistics["fused"], 1)
         self.assertNotIn("serve.kv.append", names)
+        self.assertNotIn("serve.kv.read", names)
         self.assertEqual(names.count("serve.kv.length"), 1)
         self.assertEqual(names.count("serve.kv.store"), 1)
         self.assertEqual(names.count("serve.kv.advance"), 1)
-        self.assertEqual(len(names), 47)
+        self.assertEqual(names.count("serve.decode_attention"), 1)
+        self.assertEqual(len(names), 37)
         self.assertIsInstance(state_type, KVStateType)
         self.assertEqual(state_type.layout, "contiguous_bshd")
         self.assertEqual(state_type.capacity, 65)
@@ -342,9 +345,11 @@ class KVStateCompilerTest(unittest.TestCase):
         second = manager.run(module)
         state_type = module.functions[0].block.arguments[-1].type
 
-        self.assertEqual(first[-1].statistics["bufferized"], 1)
+        self.assertEqual(first[-2].statistics["bufferized"], 1)
+        self.assertEqual(first[-1].statistics["fused"], 1)
         self.assertTrue(all(not result.changed for result in second))
-        self.assertEqual(second[-1].statistics["bufferized"], 0)
+        self.assertEqual(second[-2].statistics["bufferized"], 0)
+        self.assertEqual(second[-1].statistics["fused"], 0)
         self.assertIsInstance(state_type, KVStateType)
         self.assertEqual(state_type.capacity, 128)
 

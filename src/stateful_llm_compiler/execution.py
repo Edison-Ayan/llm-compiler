@@ -177,6 +177,96 @@ class PreallocatedKVCacheState:
             value[:, :used].transpose(1, 2),
         )
 
+    def decode_attention(
+        self,
+        slot: int,
+        query: torch.Tensor,
+        attention_mask: torch.Tensor,
+        *,
+        groups: int,
+        scale: float,
+        runner=None,
+    ) -> torch.Tensor:
+        """直接读取 B×Capacity×H×D Buffer，不构造完整逻辑 KV Cache。"""
+
+        key_buffer, value_buffer, lengths = self._attention_inputs(
+            slot,
+            query,
+            attention_mask,
+            groups,
+        )
+        if runner is not None:
+            return runner(
+                query,
+                key_buffer,
+                value_buffer,
+                lengths,
+                attention_mask,
+                scale=scale,
+            )
+
+        sequence = attention_mask.shape[-1]
+        key = key_buffer[:, :sequence].permute(0, 2, 1, 3)
+        value = value_buffer[:, :sequence].permute(0, 2, 1, 3)
+        head_indices = torch.arange(
+            query.shape[1],
+            device=query.device,
+        ) // groups
+        key = key.index_select(1, head_indices)
+        value = value.index_select(1, head_indices)
+
+        scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+        scores = scores.float() + attention_mask.float()
+        valid = torch.arange(
+            sequence,
+            device=query.device,
+        ).view(1, 1, 1, sequence) < lengths.view(-1, 1, 1, 1)
+        scores = scores.masked_fill(~valid, float("-inf"))
+        probabilities = torch.softmax(scores, dim=-1).to(query.dtype)
+        return torch.matmul(probabilities, value)
+
+    def _attention_inputs(
+        self,
+        slot: int,
+        query: torch.Tensor,
+        attention_mask: torch.Tensor,
+        groups: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        try:
+            key_buffer = self.keys[slot]
+            value_buffer = self.values[slot]
+            lengths = self.lengths[slot]
+        except IndexError as error:
+            raise ExecutionError(f"KV Buffer 不存在 Slot {slot}") from error
+        if query.ndim != 4 or query.shape[2] != 1:
+            raise ExecutionError(
+                "Decode Attention 的 Query 必须是 B×H×1×D"
+            )
+        if attention_mask.ndim != 4 or attention_mask.shape[2] != 1:
+            raise ExecutionError(
+                "Decode Attention 的 Mask 必须是 B×1×1×S"
+            )
+        if (
+            query.shape[0] != key_buffer.shape[0]
+            or query.shape[0] != attention_mask.shape[0]
+            or query.shape[3] != key_buffer.shape[3]
+        ):
+            raise ExecutionError(
+                "Decode Attention 的 Batch 或 Head Dim 与 KV Buffer 不匹配"
+            )
+        if groups <= 0 or query.shape[1] != key_buffer.shape[2] * groups:
+            raise ExecutionError("Decode Attention 的 GQA Groups 不匹配")
+        if attention_mask.shape[-1] > self.capacity:
+            raise ExecutionError(
+                "Decode Attention 的 Mask 长度超过 KV Capacity"
+            )
+        _ensure_kv_capacity(
+            lengths,
+            attention_mask.shape[-1],
+            "Decode Attention 的逻辑长度超过 Mask 长度",
+        )
+        return key_buffer, value_buffer, lengths
+
     def store(
         self,
         slot: int,
@@ -397,6 +487,11 @@ class ReferenceExecutor:
                 [environment[value.name] for value in operands],
                 attributes,
             )
+        if name == "serve.decode_attention":
+            return self._serve_decode_attention(
+                [environment[value.name] for value in operands],
+                attributes,
+            )
         handler = self._handlers.get(name)
         if handler is None:
             raise ExecutionError(f"参考执行器尚不支持操作 {name}")
@@ -524,6 +619,27 @@ class ReferenceExecutor:
         return operands[0].advance(
             int(attributes.get("slot", 0)),
             delta=int(attributes.get("delta", 1)),
+        )
+
+    @staticmethod
+    def _serve_decode_attention(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> torch.Tensor:
+        if len(operands) != 3 or not isinstance(
+            operands[0],
+            PreallocatedKVCacheState,
+        ):
+            raise ExecutionError(
+                "serve.decode_attention 需要 state、query 和 mask"
+            )
+        state, query, attention_mask = operands
+        return state.decode_attention(
+            int(attributes.get("slot", 0)),
+            query,
+            attention_mask,
+            groups=int(attributes["groups"]),
+            scale=float(attributes["scale"]),
         )
 
 

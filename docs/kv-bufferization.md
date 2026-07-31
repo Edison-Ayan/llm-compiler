@@ -297,27 +297,24 @@ PYTHONPATH=src python benchmarks/bench_kv_store.py \
   --out artifacts/kv_store_benchmark.json
 ```
 
+## 已完成的后续衔接
+
+`serve.kv.read → repeat_interleave → matmul → softmax → matmul` 已进一步融合为
+`serve.decode_attention`。新操作直接接收状态、Query 和 Mask，Triton Lowering
+直接读取物理 Buffer 和设备 Length，不再通过 `read()` 构造逻辑 KV View。
+
+具体设计、正确性和 GPU 结果见 `docs/decode-attention.md`。
+
 ## 当前边界
 
 - 当前只自动 Bufferize 一个 Decoder Layer/Slot；
-- Reference Attention 仍通过 `serve.kv.read` 创建逻辑 B×H×S×D View，并执行普通
-  Matmul；还没有直接消费 Buffer、Lengths 和 Slot；
-- `read()` 为了构造动态 View 会读取最大 Length，参考执行器在 CUDA 上会产生主机同步；
+- 非 Bufferized Stateful 路径仍保留 `serve.kv.read` 作为清晰的参考语义；
+- Bufferized Decode 已由 `serve.decode_attention` 直接消费 Buffer、Lengths 和 Slot；
 - Store 已支持每 Batch 不同 Position，但当前前端 Mask Fixture 仍使用统一 Past Length；
 - Capacity 来自导出上界或命令行，还没有独立的全局显存规划器；
 - 尚未实现 KV Buffer 分配/释放 Operation；
 - 尚未实现 Paged Layout 和 Block Table；
 - Benchmark 只测 Cache 更新，不包含完整 Attention 和端到端 Token 延迟。
 
-下一阶段应当把 Attention Lower 成直接接收：
-
-```text
-key_buffer
-value_buffer
-lengths
-slot/block_table
-```
-
-从而消除 `serve.kv.read` 的完整逻辑 Tensor 物化，并接入 FlashAttention/Paged
-Attention ABI。
-
+下一阶段应把连续 Buffer 扩展为 Paged Layout，并让 Attention 接收 Block Table，
+同时增加长上下文 Split-Sequence 和 Profile-Guided Kernel 配置。

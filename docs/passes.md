@@ -67,18 +67,20 @@ Pattern Rewrite 依赖这些信息回答：
 
 ## RemoveExportAssertions
 
-`torch.export` 会插入 `aten._assert_tensor_metadata.default`，用于检查 DType、Device 和
-Layout。ServeIR 已把这些信息编码进函数类型和入口契约，因此可以删除结果未被使用的断言。
+`torch.export` 会插入 `aten._assert_tensor_metadata.default` 和
+`aten._assert_scalar.default`，用于检查 DType、Device、Layout 和动态 Shape 关系。
+ServeIR 已把这些信息编码进函数类型和入口契约，因此可以删除结果未被使用的断言。
 
 Pass 采用保守策略：
 
 - 断言结果没有任何使用：删除；
 - 断言结果参与后续计算：保留并计入 `skipped`。
+- 删除断言后，只为断言服务的 `sym_size/builtin.eq/builtin.add` 纯元数据链递归 DCE。
 
-当前 Decoder 删除了 11 个元数据断言：
+当前 PyTorch 2.8 环境中的 Decoder 删除了 14 个断言和 6 个死元数据操作：
 
 ```text
-67 → 56 Operations
+76 → 56 Operations
 ```
 
 ## RMSNorm Pattern

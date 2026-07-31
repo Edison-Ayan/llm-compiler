@@ -13,6 +13,7 @@ from ..execution import (
     PreallocatedKVCacheState,
     ReferenceExecutor,
 )
+from .triton_attention import triton_decode_attention
 from .triton_kv import triton_kv_store
 from .triton_rmsnorm import triton_rms_norm
 
@@ -126,6 +127,28 @@ class TritonExecutor(ReferenceExecutor):
             value,
             positions,
             writer=triton_kv_store,
+        )
+
+    @staticmethod
+    def _serve_decode_attention(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> torch.Tensor:
+        if len(operands) != 3 or not isinstance(
+            operands[0],
+            PreallocatedKVCacheState,
+        ):
+            raise ExecutionError(
+                "serve.decode_attention 需要 state、query 和 mask"
+            )
+        state, query, attention_mask = operands
+        return state.decode_attention(
+            int(attributes.get("slot", 0)),
+            query,
+            attention_mask,
+            groups=int(attributes["groups"]),
+            scale=float(attributes["scale"]),
+            runner=triton_decode_attention,
         )
 
 

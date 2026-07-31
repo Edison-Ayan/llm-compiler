@@ -278,6 +278,7 @@ def _verify_kv_operation(operation: Operation, errors: list[str]) -> None:
         "serve.kv.length",
         "serve.kv.store",
         "serve.kv.advance",
+        "serve.decode_attention",
     }:
         return
     if not operation.operands or not isinstance(
@@ -376,6 +377,60 @@ def _verify_kv_operation(operation: Operation, errors: list[str]) -> None:
             or operation.results[0].type != operation.operands[0].type
         ):
             errors.append("serve.kv.advance 必须返回同类型的新状态")
+    elif operation.name == "serve.decode_attention":
+        _verify_decode_attention(operation, errors)
+
+
+def _verify_decode_attention(
+    operation: Operation,
+    errors: list[str],
+) -> None:
+    """验证直接消费物理 KV Buffer 的 Decode Attention 契约。"""
+
+    if len(operation.operands) != 3:
+        errors.append(
+            "serve.decode_attention 必须接收 state、query 和 mask"
+        )
+        return
+    state_type = operation.operands[0].type
+    query_type = operation.operands[1].type
+    mask_type = operation.operands[2].type
+    if not isinstance(state_type, KVStateType):
+        return
+    if state_type.layout != "contiguous_bshd":
+        errors.append(
+            "serve.decode_attention 只支持 contiguous_bshd KV Layout"
+        )
+    if not isinstance(query_type, TensorType) or len(query_type.shape) != 4:
+        errors.append("serve.decode_attention 的 query 必须是四维 Tensor")
+        return
+    if not isinstance(mask_type, TensorType) or len(mask_type.shape) != 4:
+        errors.append("serve.decode_attention 的 mask 必须是四维 Tensor")
+    groups = operation.attributes.get("groups")
+    if not isinstance(groups, int) or groups <= 0:
+        errors.append("serve.decode_attention 的 groups 必须为正整数")
+    elif isinstance(query_type.shape[1], StaticDim):
+        expected_heads = state_type.num_kv_heads * groups
+        if query_type.shape[1].value != expected_heads:
+            errors.append(
+                "serve.decode_attention 的 Query Head 数量必须等于 "
+                "KV Head 数量乘以 groups"
+            )
+    if (
+        isinstance(query_type.shape[3], StaticDim)
+        and query_type.shape[3].value != state_type.head_dim
+    ):
+        errors.append("serve.decode_attention 的 Head Dim 与 KV 状态不匹配")
+    scale = operation.attributes.get("scale")
+    if not isinstance(scale, (int, float)) or float(scale) <= 0:
+        errors.append("serve.decode_attention 的 scale 必须为正数")
+    if (
+        len(operation.results) != 1
+        or operation.results[0].type != query_type
+    ):
+        errors.append(
+            "serve.decode_attention 必须返回与 query 同类型的 Context"
+        )
 
 
 def _verify_kv_tensor(

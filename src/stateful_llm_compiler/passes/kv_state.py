@@ -29,7 +29,7 @@ class MaterializeKVStatePass(CompilerPass):
         rejected = 0
         for function in module.functions:
             result = _rewrite_function(function)
-            converted += int(result)
+            converted += int(result is True)
             rejected += int(result is None)
         return PassResult(
             self.name,

@@ -7,6 +7,7 @@ import torch
 
 from stateful_llm_compiler.backends import (
     TritonExecutor,
+    triton_decode_attention,
     triton_kv_store,
     triton_rms_norm,
 )
@@ -299,6 +300,12 @@ class TritonRMSNormTest(unittest.TestCase):
             function_name="decode",
         )
         default_pass_manager(preallocate_kv=True).run(module)
+        operation_names = [
+            operation.name
+            for operation in module.functions[0].block.operations
+        ]
+        self.assertIn("serve.decode_attention", operation_names)
+        self.assertNotIn("serve.kv.read", operation_names)
         state = PreallocatedKVCacheState.from_tensors(
             example[2],
             example[3],
@@ -351,6 +358,62 @@ class TritonRMSNormTest(unittest.TestCase):
                 state.keys[0].data_ptr(),
                 state.values[0].data_ptr(),
             ),
+        )
+
+    def test_triton_decode_attention_supports_per_batch_lengths(
+        self,
+    ) -> None:
+        batch, capacity, query_heads, kv_heads, head_dim = 3, 65, 4, 2, 16
+        query = torch.randn(
+            batch,
+            query_heads,
+            1,
+            head_dim,
+            device="cuda",
+        )
+        key_buffer = torch.randn(
+            batch,
+            capacity,
+            kv_heads,
+            head_dim,
+            device="cuda",
+        )
+        value_buffer = torch.randn_like(key_buffer)
+        lengths = torch.tensor([7, 31, 65], device="cuda")
+        attention_mask = torch.zeros(
+            batch,
+            1,
+            1,
+            capacity,
+            device="cuda",
+        )
+        state = PreallocatedKVCacheState(
+            (key_buffer,),
+            (value_buffer,),
+            (lengths,),
+            capacity,
+        )
+        expected = state.decode_attention(
+            0,
+            query,
+            attention_mask,
+            groups=query_heads // kv_heads,
+            scale=head_dim**-0.5,
+        )
+        actual = triton_decode_attention(
+            query,
+            key_buffer,
+            value_buffer,
+            lengths,
+            attention_mask,
+            scale=head_dim**-0.5,
+        )
+
+        torch.testing.assert_close(
+            actual,
+            expected,
+            rtol=3e-5,
+            atol=3e-5,
         )
 
     def test_triton_kv_store_supports_per_batch_positions(self) -> None:

@@ -15,6 +15,7 @@ from .ir import format_module
 from .pass_manager import PassManager
 from .passes import (
     BufferizeKVCachePass,
+    FuseDecodeAttentionPass,
     FuseRMSNormPass,
     MaterializeKVStatePass,
     RemoveExportAssertionsPass,
@@ -37,6 +38,7 @@ def default_pass_manager(
         passes.append(MaterializeKVStatePass())
     if preallocate_kv:
         passes.append(BufferizeKVCachePass(capacity=kv_capacity))
+        passes.append(FuseDecodeAttentionPass())
     if cost_model is not None:
         passes.append(SelectRMSNormLoweringPass(cost_model))
     return PassManager(passes)

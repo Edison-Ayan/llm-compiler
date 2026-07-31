@@ -81,8 +81,13 @@ def _node_type(node: Node, ranges: dict[str, str]) -> IRType:
 
 def _operation_name(target: Any) -> tuple[str, str | None]:
     target_text = str(target)
-    if target is operator.getitem:
-        return "builtin.getitem", None
+    builtin_targets = {
+        operator.getitem: "builtin.getitem",
+        operator.eq: "builtin.eq",
+        operator.add: "builtin.add",
+    }
+    if target in builtin_targets:
+        return builtin_targets[target], None
     if target_text.startswith("aten."):
         return target_text, None
     return "serve.external", target_text
@@ -214,4 +219,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
