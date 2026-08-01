@@ -103,7 +103,9 @@ Pass 只有同时满足以下条件时才改写：
 - 两者均为四维 Tensor；
 - KV Head 数量和 Head Dim 是静态维度；
 - 每个历史 Tensor 只被唯一的 `aten.cat` 使用；
-- 每个 `cat` 恰好包含一个历史值和一个当前值。
+- 每个 `cat` 必须严格采用 `[past, current]` 顺序并沿序列维 `dim=2` 追加；
+- Past、Current 和 Present 的 Key/Value 必须具有兼容的 DType、Device、Batch、Head
+  数量和 Head Dim。
 
 无法证明这些条件时，Pass 拒绝改写，避免错误地引入状态语义。
 

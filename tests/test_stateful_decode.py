@@ -16,6 +16,7 @@ from stateful_llm_compiler.importer import import_exported_program
 from stateful_llm_compiler.ir import (
     EffectKind,
     KVStateType,
+    TensorType,
     format_module,
     verify_module,
 )
@@ -27,6 +28,7 @@ from stateful_llm_compiler.model import (
     make_inputs,
 )
 from stateful_llm_compiler.optimizer import default_pass_manager
+from stateful_llm_compiler.passes import MaterializeKVStatePass
 
 
 class StatefulDecodeFrontendTest(unittest.TestCase):
@@ -168,6 +170,38 @@ class KVStateCompilerTest(unittest.TestCase):
 
         self.assertTrue(all(not result.changed for result in second))
         self.assertEqual(second[-1].statistics["converted"], 0)
+
+    def test_materialization_rejects_wrong_cat_axis(self) -> None:
+        module = self.make_module()
+        key_cat = self._cache_cat(module, "%past_key")
+        key_cat.attributes["args"]["tuple"][1] = 1
+
+        self._assert_materialization_rejected(module)
+
+    def test_materialization_rejects_reversed_cat_order(self) -> None:
+        module = self.make_module()
+        key_cat = self._cache_cat(module, "%past_key")
+        key_cat.operands.reverse()
+        key_cat.attributes["args"]["tuple"][0].reverse()
+
+        self._assert_materialization_rejected(module)
+
+    def test_materialization_rejects_incompatible_cache_types(self) -> None:
+        module = self.make_module()
+        function = module.functions[0]
+        past_value = next(
+            argument
+            for argument in function.block.arguments
+            if argument.name == "%past_value"
+        )
+        assert isinstance(past_value.type, TensorType)
+        past_value.type = TensorType(
+            past_value.type.shape,
+            "f16",
+            past_value.type.device,
+        )
+
+        self._assert_materialization_rejected(module)
 
     def test_reference_executor_preserves_four_decode_rounds(self) -> None:
         module = self.make_module()
@@ -364,6 +398,34 @@ class KVStateCompilerTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ExecutionError, "第 0 维不匹配"):
             state.append(0, wrong_batch, wrong_batch)
+
+    @staticmethod
+    def _cache_cat(module, argument_name: str):
+        function = module.functions[0]
+        argument = next(
+            value
+            for value in function.block.arguments
+            if value.name == argument_name
+        )
+        return next(
+            operation
+            for operation in function.block.operations
+            if operation.name == "aten.cat.default"
+            and argument in operation.operands
+        )
+
+    def _assert_materialization_rejected(self, module) -> None:
+        result = MaterializeKVStatePass().run(module)
+        names = [
+            operation.name
+            for operation in module.functions[0].block.operations
+        ]
+
+        self.assertFalse(result.changed)
+        self.assertEqual(result.statistics["converted"], 0)
+        self.assertEqual(result.statistics["rejected"], 1)
+        self.assertEqual(names.count("aten.cat.default"), 2)
+        self.assertNotIn("serve.kv.append", names)
 
 
 if __name__ == "__main__":

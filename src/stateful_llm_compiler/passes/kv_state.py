@@ -58,9 +58,18 @@ def _rewrite_function(function) -> bool | None:
     value_cat = _find_cache_cat(function, past_value)
     if key_cat is None or value_cat is None:
         return None
-    current_key = _other_operand(key_cat, past_key)
-    current_value = _other_operand(value_cat, past_value)
+    current_key = _match_cache_cat(key_cat, past_key)
+    current_value = _match_cache_cat(value_cat, past_value)
     if current_key is None or current_value is None:
+        return None
+    if not _compatible_cache_types(
+        past_key,
+        past_value,
+        current_key,
+        current_value,
+        key_cat.results[0],
+        value_cat.results[0],
+    ):
         return None
 
     analysis = UseDefAnalysis(function)
@@ -200,16 +209,73 @@ def _find_cache_cat(function, past: Value) -> Operation | None:
     return matches[0] if len(matches) == 1 else None
 
 
-def _other_operand(
+def _match_cache_cat(
     operation: Operation,
     past: Value,
 ) -> Value | None:
-    candidates = [
-        operand
-        for operand in operation.operands
-        if operand is not past
-    ]
-    return candidates[0] if len(candidates) == 1 else None
+    """验证 `cat([past, current], dim=2)` 并返回当前 Token。"""
+
+    if len(operation.operands) != 2 or operation.operands[0] is not past:
+        return None
+    current = operation.operands[1]
+    arguments = operation.attributes.get("args")
+    if not isinstance(arguments, dict):
+        return None
+    positional = arguments.get("tuple")
+    if not isinstance(positional, list) or len(positional) != 2:
+        return None
+    tensors, axis = positional
+    if axis != 2 or not isinstance(tensors, list) or len(tensors) != 2:
+        return None
+    if tensors != [{"ssa": past.name}, {"ssa": current.name}]:
+        return None
+    return current
+
+
+def _compatible_cache_types(
+    past_key: Value,
+    past_value: Value,
+    current_key: Value,
+    current_value: Value,
+    present_key: Value,
+    present_value: Value,
+) -> bool:
+    """确认 Key/Value 在 DType、设备和非序列维度上完全兼容。"""
+
+    values = (
+        past_key,
+        past_value,
+        current_key,
+        current_value,
+        present_key,
+        present_value,
+    )
+    if any(not isinstance(value.type, TensorType) for value in values):
+        return False
+    if past_key.type != past_value.type:
+        return False
+    if current_key.type != current_value.type:
+        return False
+    if present_key.type != present_value.type:
+        return False
+    return all(
+        _same_cache_structure(past_key.type, value.type)
+        for value in (current_key, present_key)
+    )
+
+
+def _same_cache_structure(left: TensorType, right: TensorType) -> bool:
+    """忽略可增长的序列维度，比较 B×H×S×D Cache 契约。"""
+
+    return (
+        len(left.shape) == 4
+        and len(right.shape) == 4
+        and left.dtype == right.dtype
+        and left.device == right.device
+        and left.shape[0] == right.shape[0]
+        and left.shape[1] == right.shape[1]
+        and left.shape[3] == right.shape[3]
+    )
 
 
 def _infer_state_type(
