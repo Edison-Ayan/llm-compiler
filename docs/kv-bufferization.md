@@ -97,17 +97,19 @@ capacity = 65
 )
     effects[read(kv.layer0), write(kv.layer0)]
 
-%next = serve.kv.advance(%stored)
+%next = serve.kv.advance(%stored) {delta=当前 K/V 的静态 Token 数}
     effects[read(kv.layer0), write(kv.layer0)]
 ```
 
 `positions` 是 `[batch]` 的 i64 Tensor，因此不同 Batch Item 可以拥有不同写入位置。
-当前导出 Fixture 使用统一历史长度，但低层 Store 已支持 Ragged Position。
+当前单 Token Decode 的 `delta=1`；低层 Store 同时支持多个新 Token 和 Ragged Position。
+Pass 会先验证函数中的全部 Append，只有全部满足类型、Axis、Capacity 和静态 Token 数约束
+时才统一提交改写，避免留下部分 Bufferize 的混合 IR。
 
 Pass 前后 Operation 数量：
 
 ```text
-导入：             68
+导入：             85
 删除断言：         57
 融合 RMSNorm：     45
 状态语义恢复：     45

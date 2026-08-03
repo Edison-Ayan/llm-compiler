@@ -404,8 +404,20 @@ def _verify_decode_attention(
     if not isinstance(query_type, TensorType) or len(query_type.shape) != 4:
         errors.append("serve.decode_attention 的 query 必须是四维 Tensor")
         return
+    query_tokens = query_type.shape[2]
+    if not isinstance(query_tokens, StaticDim) or query_tokens.value != 1:
+        errors.append("serve.decode_attention 的 query 必须是单 Token")
     if not isinstance(mask_type, TensorType) or len(mask_type.shape) != 4:
         errors.append("serve.decode_attention 的 mask 必须是四维 Tensor")
+    else:
+        mask_heads = mask_type.shape[1]
+        mask_queries = mask_type.shape[2]
+        if not isinstance(mask_heads, StaticDim) or mask_heads.value != 1:
+            errors.append("serve.decode_attention 的 mask Head 维必须为 1")
+        if not isinstance(mask_queries, StaticDim) or mask_queries.value != 1:
+            errors.append("serve.decode_attention 的 mask Query 维必须为 1")
+        if mask_type.shape[0] != query_type.shape[0]:
+            errors.append("serve.decode_attention 的 mask Batch 与 query 不匹配")
     groups = operation.attributes.get("groups")
     if not isinstance(groups, int) or groups <= 0:
         errors.append("serve.decode_attention 的 groups 必须为正整数")

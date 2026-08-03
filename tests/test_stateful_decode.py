@@ -4,6 +4,7 @@ import unittest
 
 import torch
 
+from stateful_llm_compiler.analysis import UseDefAnalysis
 from stateful_llm_compiler.execution import (
     ExecutionError,
     KVCacheState,
@@ -16,7 +17,11 @@ from stateful_llm_compiler.importer import import_exported_program
 from stateful_llm_compiler.ir import (
     EffectKind,
     KVStateType,
+    Operation,
+    StaticDim,
     TensorType,
+    Value,
+    VerificationError,
     format_module,
     verify_module,
 )
@@ -28,7 +33,12 @@ from stateful_llm_compiler.model import (
     make_inputs,
 )
 from stateful_llm_compiler.optimizer import default_pass_manager
-from stateful_llm_compiler.passes import MaterializeKVStatePass
+from stateful_llm_compiler.passes import (
+    BufferizeKVCachePass,
+    FuseDecodeAttentionPass,
+    MaterializeKVStatePass,
+)
+from stateful_llm_compiler.passes.decode_attention import _match_attention
 
 
 class StatefulDecodeFrontendTest(unittest.TestCase):
@@ -278,10 +288,176 @@ class KVStateCompilerTest(unittest.TestCase):
         self.assertEqual(names.count("serve.kv.advance"), 1)
         self.assertEqual(names.count("serve.decode_attention"), 1)
         self.assertEqual(len(names), 37)
+        advance = next(
+            operation
+            for operation in function.block.operations
+            if operation.name == "serve.kv.advance"
+        )
+        self.assertEqual(advance.attributes["delta"], 1)
         self.assertIsInstance(state_type, KVStateType)
         self.assertEqual(state_type.layout, "contiguous_bshd")
         self.assertEqual(state_type.capacity, 65)
         verify_module(module)
+
+    def test_bufferization_derives_multi_token_advance_delta(self) -> None:
+        module = self.make_module()
+        default_pass_manager(stateful_decode=True).run(module)
+        append = next(
+            operation
+            for operation in module.functions[0].block.operations
+            if operation.name == "serve.kv.append"
+        )
+        for current in append.operands[1:]:
+            assert isinstance(current.type, TensorType)
+            shape = list(current.type.shape)
+            shape[2] = StaticDim(2)
+            current.type = TensorType(
+                tuple(shape),
+                current.type.dtype,
+                current.type.device,
+            )
+
+        result = BufferizeKVCachePass().run(module)
+        advance = next(
+            operation
+            for operation in module.functions[0].block.operations
+            if operation.name == "serve.kv.advance"
+        )
+
+        self.assertTrue(result.changed)
+        self.assertEqual(advance.attributes["delta"], 2)
+
+    def test_bufferization_is_transactional(self) -> None:
+        module = self.make_module()
+        default_pass_manager(stateful_decode=True).run(module)
+        function = module.functions[0]
+        append = next(
+            operation
+            for operation in function.block.operations
+            if operation.name == "serve.kv.append"
+        )
+        bad_append = Operation(
+            "serve.kv.append",
+            list(append.operands),
+            [Value("%bad_kv_state", append.results[0].type)],
+            attributes={**append.attributes, "axis": 1},
+            effects=append.effects,
+        )
+        function.block.operations.insert(
+            function.block.operations.index(append) + 1,
+            bad_append,
+        )
+        old_type = append.operands[0].type
+
+        result = BufferizeKVCachePass().run(module)
+        names = [operation.name for operation in function.block.operations]
+
+        self.assertFalse(result.changed)
+        self.assertEqual(result.statistics["rejected"], 1)
+        self.assertEqual(result.statistics["transaction_aborted"], 1)
+        self.assertEqual(names.count("serve.kv.append"), 2)
+        self.assertNotIn("serve.kv.store", names)
+        self.assertEqual(append.operands[0].type, old_type)
+
+    def test_bufferization_rejects_unknown_layout(self) -> None:
+        with self.assertRaisesRegex(ValueError, "暂不支持"):
+            BufferizeKVCachePass(layout="paged")
+
+    def test_attention_fusion_rejects_reversed_score_matmul(self) -> None:
+        module = self.make_module()
+        default_pass_manager(stateful_decode=True).run(module)
+        BufferizeKVCachePass().run(module)
+        function = module.functions[0]
+        read = next(
+            operation
+            for operation in function.block.operations
+            if operation.name == "serve.kv.read"
+        )
+        match = _match_attention(read, UseDefAnalysis(function))
+        assert match is not None
+        score_matmul = next(
+            operation
+            for operation in match.operations
+            if operation.name == "aten.matmul.default"
+            and operation is not match.final_matmul
+        )
+        score_matmul.operands.reverse()
+        score_matmul.attributes["args"]["tuple"].reverse()
+
+        result = FuseDecodeAttentionPass().run(module)
+
+        self.assertFalse(result.changed)
+        self.assertEqual(result.statistics["rejected"], 1)
+        self.assertIn(read, function.block.operations)
+
+    def test_attention_fusion_rejects_reversed_context_matmul(self) -> None:
+        module = self.make_module()
+        default_pass_manager(stateful_decode=True).run(module)
+        BufferizeKVCachePass().run(module)
+        function = module.functions[0]
+        read = next(
+            operation
+            for operation in function.block.operations
+            if operation.name == "serve.kv.read"
+        )
+        match = _match_attention(read, UseDefAnalysis(function))
+        assert match is not None
+        match.final_matmul.operands.reverse()
+        match.final_matmul.attributes["args"]["tuple"].reverse()
+
+        result = FuseDecodeAttentionPass().run(module)
+
+        self.assertFalse(result.changed)
+        self.assertEqual(result.statistics["rejected"], 1)
+        self.assertIn(read, function.block.operations)
+
+    def test_attention_fusion_rejects_multi_token_query(self) -> None:
+        module = self.make_module()
+        default_pass_manager(stateful_decode=True).run(module)
+        BufferizeKVCachePass().run(module)
+        function = module.functions[0]
+        read = next(
+            operation
+            for operation in function.block.operations
+            if operation.name == "serve.kv.read"
+        )
+        match = _match_attention(read, UseDefAnalysis(function))
+        assert match is not None
+        assert isinstance(match.query.type, TensorType)
+        shape = list(match.query.type.shape)
+        shape[2] = StaticDim(2)
+        match.query.type = TensorType(
+            tuple(shape),
+            match.query.type.dtype,
+            match.query.type.device,
+        )
+
+        result = FuseDecodeAttentionPass().run(module)
+
+        self.assertFalse(result.changed)
+        self.assertEqual(result.statistics["rejected"], 1)
+
+    def test_verifier_rejects_multi_token_decode_attention(self) -> None:
+        module = self.make_module()
+        default_pass_manager(preallocate_kv=True).run(module)
+        operation = next(
+            operation
+            for operation in module.functions[0].block.operations
+            if operation.name == "serve.decode_attention"
+        )
+        query = operation.operands[1]
+        assert isinstance(query.type, TensorType)
+        shape = list(query.type.shape)
+        shape[2] = StaticDim(2)
+        query.type = TensorType(
+            tuple(shape),
+            query.type.dtype,
+            query.type.device,
+        )
+        operation.results[0].type = query.type
+
+        with self.assertRaisesRegex(VerificationError, "必须是单 Token"):
+            verify_module(module)
 
     def test_preallocated_runtime_preserves_values_and_addresses(self) -> None:
         module = self.make_module()

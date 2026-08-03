@@ -30,7 +30,9 @@ serve.kv.read
 
 `FuseDecodeAttentionPass` 对 Use-Def 链做保守匹配。只有完整子图没有中间结果逃逸、
 GQA Group 一致、Softmax 位于最后一维，并且 KV Layout 已经是
-`contiguous_bshd` 时才融合。
+`contiguous_bshd` 时才融合。当前 Triton ABI 还要求 Query 为 `B×QH×1×D`、Mask 为
+`B×1×1×S`；两个 Matmul 必须严格保持 `Query @ Keyᵀ` 和 `Probability @ Value` 的
+非交换顺序，Operand 与 FX Attribute 参数树也必须一致。
 
 融合前：
 

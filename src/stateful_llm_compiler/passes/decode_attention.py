@@ -6,7 +6,16 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..analysis import UseDefAnalysis
-from ..ir import Effect, EffectKind, KVStateType, Module, Operation, Value
+from ..ir import (
+    Effect,
+    EffectKind,
+    KVStateType,
+    Module,
+    Operation,
+    StaticDim,
+    TensorType,
+    Value,
+)
 from ..pass_manager import CompilerPass, PassResult
 
 
@@ -31,7 +40,7 @@ class FuseDecodeAttentionPass(CompilerPass):
 
     def run(self, module: Module) -> PassResult:
         fused = 0
-        rejected = 0
+        rejected_operations: set[int] = set()
         for function in module.functions:
             while True:
                 analysis = UseDefAnalysis(function)
@@ -42,7 +51,7 @@ class FuseDecodeAttentionPass(CompilerPass):
                     match = _match_attention(operation, analysis)
                     if match is not None:
                         break
-                    rejected += 1
+                    rejected_operations.add(id(operation))
                 if match is None:
                     break
                 _replace_attention(function, match)
@@ -53,7 +62,7 @@ class FuseDecodeAttentionPass(CompilerPass):
             changed=fused > 0,
             statistics={
                 "fused": fused,
-                "rejected": rejected,
+                "rejected": len(rejected_operations),
                 "algorithm": "online_softmax",
             },
         )
@@ -110,8 +119,13 @@ def _match_attention(
     )
     if score_matmul is None or len(score_matmul.operands) != 2:
         return None
-    query = _other_operand(score_matmul, key_transpose.results[0])
-    if query is None:
+    if score_matmul.operands[1] is not key_transpose.results[0]:
+        return None
+    query = score_matmul.operands[0]
+    if not _ssa_arguments_match(
+        score_matmul,
+        (query, key_transpose.results[0]),
+    ):
         return None
 
     division = _single_user(
@@ -163,7 +177,21 @@ def _match_attention(
     if (
         context_matmul is None
         or len(context_matmul.operands) != 2
-        or value_repeat.results[0] not in context_matmul.operands
+        or context_matmul.operands[0] is not probability_value
+        or context_matmul.operands[1] is not value_repeat.results[0]
+    ):
+        return None
+    if not _ssa_arguments_match(
+        context_matmul,
+        (probability_value, value_repeat.results[0]),
+    ):
+        return None
+    if not _valid_decode_contract(
+        state_type,
+        query,
+        mask,
+        context_matmul.results[0],
+        groups,
     ):
         return None
 
@@ -188,13 +216,16 @@ def _match_attention(
     ):
         return None
 
+    slot = read.attributes.get("slot", 0)
+    if not isinstance(slot, int) or slot < 0:
+        return None
     return _AttentionMatch(
         tuple(operations),
         context_matmul,
         read.operands[0],
         query,
         mask,
-        int(read.attributes.get("slot", 0)),
+        slot,
         groups,
         1.0 / float(divisor),
     )
@@ -272,6 +303,22 @@ def _literal_argument(
     return arguments["tuple"][index]
 
 
+def _ssa_arguments_match(
+    operation: Operation,
+    values: tuple[Value, ...],
+) -> bool:
+    """确认非交换算子的 FX 参数顺序与 Operand 顺序一致。"""
+
+    arguments = operation.attributes.get("args")
+    if not isinstance(arguments, dict) or set(arguments) != {"tuple"}:
+        return False
+    positional = arguments["tuple"]
+    return (
+        isinstance(positional, list)
+        and positional == [{"ssa": value.name} for value in values]
+    )
+
+
 def _repeat_spec(operation: Operation) -> tuple[int, int] | None:
     repeats = _literal_argument(operation, 1)
     dimension = _literal_argument(operation, 2)
@@ -286,6 +333,44 @@ def _transpose_dims(operation: Operation) -> tuple[int, int] | None:
     if not isinstance(first, int) or not isinstance(second, int):
         return None
     return first, second
+
+
+def _valid_decode_contract(
+    state_type: KVStateType,
+    query: Value,
+    mask: Value,
+    context: Value,
+    groups: int,
+) -> bool:
+    """验证当前 Triton Lowering 所需的单 Token GQA 类型契约。"""
+
+    if not isinstance(query.type, TensorType) or not isinstance(
+        mask.type,
+        TensorType,
+    ):
+        return False
+    if len(query.type.shape) != 4 or len(mask.type.shape) != 4:
+        return False
+    query_heads = query.type.shape[1]
+    query_tokens = query.type.shape[2]
+    query_head_dim = query.type.shape[3]
+    mask_heads = mask.type.shape[1]
+    mask_queries = mask.type.shape[2]
+    return (
+        isinstance(query_heads, StaticDim)
+        and query_heads.value == state_type.num_kv_heads * groups
+        and isinstance(query_tokens, StaticDim)
+        and query_tokens.value == 1
+        and isinstance(query_head_dim, StaticDim)
+        and query_head_dim.value == state_type.head_dim
+        and isinstance(mask_heads, StaticDim)
+        and mask_heads.value == 1
+        and isinstance(mask_queries, StaticDim)
+        and mask_queries.value == 1
+        and query.type.shape[0] == mask.type.shape[0]
+        and query.type.device == mask.type.device
+        and context.type == query.type
+    )
 
 
 def _is_closed_subgraph(

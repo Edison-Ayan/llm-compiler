@@ -157,6 +157,7 @@ def triton_decode_attention(
         or key_buffer.ndim != 4
         or key_buffer.shape != value_buffer.shape
         or attention_mask.ndim != 4
+        or attention_mask.shape[1] != 1
         or attention_mask.shape[2] != 1
     ):
         raise ValueError("Triton Decode Attention 收到非法 Shape")
