@@ -79,6 +79,11 @@ class TritonExecutor(ReferenceExecutor):
                 runtime_operands,
                 attributes,
             )
+        if name == "kernel.cuda.rms_norm":
+            return self._kernel_cuda_rms_norm(
+                runtime_operands,
+                attributes,
+            )
         if name == "kernel.triton.linear":
             return self._kernel_triton_linear(runtime_operands, attributes)
         if name == "kernel.cublas.linear":
@@ -88,8 +93,15 @@ class TritonExecutor(ReferenceExecutor):
                 runtime_operands,
                 attributes,
             )
+        if name == "kernel.cuda.prefill_attention":
+            return self._kernel_cuda_prefill_attention(
+                runtime_operands,
+                attributes,
+            )
         if name == "kernel.triton.rope":
             return self._kernel_triton_rope(runtime_operands, attributes)
+        if name == "kernel.cuda.rope":
+            return self._kernel_cuda_rope(runtime_operands, attributes)
         if name == "kernel.triton.kv_store":
             return self._serve_kv_store(runtime_operands, attributes)
         if name == "kernel.triton.kv_prefill_store":
@@ -99,6 +111,11 @@ class TritonExecutor(ReferenceExecutor):
             )
         if name == "kernel.triton.decode_attention":
             return self._serve_decode_attention(runtime_operands, attributes)
+        if name == "kernel.cuda.decode_attention":
+            return self._kernel_cuda_decode_attention(
+                runtime_operands,
+                attributes,
+            )
         if name == "runtime.kv.length":
             return super()._serve_kv_length(runtime_operands, attributes)
         if name == "runtime.kv.advance":
@@ -128,6 +145,16 @@ class TritonExecutor(ReferenceExecutor):
                 "kernel.triton.linear 的 has_bias 与运行时参数不一致"
             )
         return triton_linear(tensor, weight, bias)
+
+    @staticmethod
+    def _kernel_cuda_rms_norm(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> torch.Tensor:
+        """保留官方归约、Rsqrt和BF16舍入顺序的CUDA RMSNorm路径。"""
+
+        _require_cuda_tensors(operands, "kernel.cuda.rms_norm")
+        return ReferenceExecutor._serve_rms_norm(operands, attributes)
 
     @staticmethod
     def _kernel_cublas_linear(
@@ -163,6 +190,19 @@ class TritonExecutor(ReferenceExecutor):
         )
 
     @staticmethod
+    def _kernel_cuda_prefill_attention(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> torch.Tensor:
+        """用显式CUDA复合路径保留官方BF16 Attention舍入边界。"""
+
+        _require_cuda_tensors(operands, "kernel.cuda.prefill_attention")
+        return ReferenceExecutor._serve_prefill_attention(
+            operands,
+            attributes,
+        )
+
+    @staticmethod
     def _kernel_triton_rope(
         operands: list[Any],
         attributes: dict[str, Any],
@@ -175,6 +215,16 @@ class TritonExecutor(ReferenceExecutor):
         if query.shape[-1] != int(attributes["head_dim"]):
             raise ExecutionError("kernel.triton.rope的Head Dim不匹配")
         return triton_rope(query, key, cosine, sine)
+
+    @staticmethod
+    def _kernel_cuda_rope(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """保留Mul和Add之间BF16物化边界的CUDA RoPE复合路径。"""
+
+        _require_cuda_tensors(operands, "kernel.cuda.rope")
+        return ReferenceExecutor._serve_rope(operands, attributes)
 
     @staticmethod
     def _kernel_triton_kv_prefill_store(
@@ -366,6 +416,52 @@ class TritonExecutor(ReferenceExecutor):
             runner=triton_decode_attention,
         )
 
+    @staticmethod
+    def _kernel_cuda_decode_attention(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> torch.Tensor:
+        """显式执行与官方BF16 Decode Attention一致的CUDA复合路径。"""
+
+        if len(operands) != 3 or not isinstance(
+            operands[0],
+            PreallocatedKVCacheState,
+        ):
+            raise ExecutionError(
+                "kernel.cuda.decode_attention需要state、query和mask"
+            )
+        state, query, attention_mask = operands
+        _require_cuda_tensors(
+            [query, attention_mask, *state.keys, *state.values, *state.lengths],
+            "kernel.cuda.decode_attention",
+        )
+        slot = int(attributes.get("slot", 0))
+        groups = int(attributes["groups"])
+        scale = float(attributes["scale"])
+        key_buffer, value_buffer, lengths = state._attention_inputs(
+            slot,
+            query,
+            attention_mask,
+            groups,
+        )
+        sequence = attention_mask.shape[-1]
+        # 兼容路径有意重建原图的GQA展开和中间Tensor边界。快速路径则让
+        # Triton核直接读取B×Capacity×H×D物理Buffer，避免这次物化。
+        key = key_buffer[:, :sequence].permute(0, 2, 1, 3)
+        value = value_buffer[:, :sequence].permute(0, 2, 1, 3)
+        key = key.repeat_interleave(groups, dim=1)
+        value = value.repeat_interleave(groups, dim=1)
+        scores = torch.matmul(query, key.transpose(-2, -1))
+        scores = scores * scale
+        scores = scores.float() + attention_mask.float()
+        valid = torch.arange(
+            sequence,
+            device=query.device,
+        ).view(1, 1, 1, sequence) < lengths.view(-1, 1, 1, 1)
+        scores = scores.masked_fill(~valid, float("-inf"))
+        probabilities = torch.softmax(scores, dim=-1).to(query.dtype)
+        return torch.matmul(probabilities, value)
+
 
 def _cast_output(
     tensor: torch.Tensor,
@@ -382,3 +478,15 @@ def _cast_output(
     if dtype is None:
         raise ExecutionError(f"不支持的输出 DType：{output_dtype}")
     return tensor.to(dtype)
+
+
+def _require_cuda_tensors(operands: Sequence[Any], operation: str) -> None:
+    """防止CUDA KernelIR在CPU上被误当成普通参考操作执行。"""
+
+    tensors = [
+        operand
+        for operand in operands
+        if isinstance(operand, torch.Tensor)
+    ]
+    if not tensors or not all(tensor.is_cuda for tensor in tensors):
+        raise ExecutionError(f"{operation}的所有Tensor必须位于CUDA")

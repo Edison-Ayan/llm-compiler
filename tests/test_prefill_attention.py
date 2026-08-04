@@ -183,6 +183,75 @@ class TritonPrefillAttentionTest(unittest.TestCase):
 
         torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
 
+    def test_pytorch_compatible_mode_is_bf16_bitwise_equal(self) -> None:
+        device = str(torch.device("cuda", torch.cuda.current_device()))
+        builder = IRBuilder()
+        query_type = TensorType(
+            (StaticDim(2), StaticDim(14), StaticDim(7), StaticDim(64)),
+            "bf16",
+            device,
+        )
+        kv_type = TensorType(
+            (StaticDim(2), StaticDim(2), StaticDim(7), StaticDim(64)),
+            "bf16",
+            device,
+        )
+        mask_type = TensorType(
+            (StaticDim(2), StaticDim(1), StaticDim(7), StaticDim(7)),
+            "f32",
+            device,
+        )
+        query = builder.argument(query_type, "query")
+        key = builder.argument(kv_type, "key")
+        value = builder.argument(kv_type, "value")
+        mask = builder.argument(mask_type, "mask")
+        attention = builder.emit(
+            "serve.prefill_attention",
+            [query, key, value, mask],
+            [query_type],
+            attributes={
+                "groups": 7,
+                "scale": 64**-0.5,
+                "causal": "mask",
+            },
+        )
+        module = Module(
+            [Function("main", builder.block, attention.results)]
+        )
+        LowerToKernelIRPass(
+            numerical_mode="pytorch_compatible"
+        ).run(module)
+        torch.manual_seed(2026)
+        query_tensor = torch.randn(
+            2, 14, 7, 64, device=device, dtype=torch.bfloat16
+        )
+        key_tensor = torch.randn(
+            2, 2, 7, 64, device=device, dtype=torch.bfloat16
+        )
+        value_tensor = torch.randn_like(key_tensor)
+        future = torch.triu(
+            torch.ones(7, 7, device=device, dtype=torch.bool),
+            diagonal=1,
+        )
+        mask_tensor = torch.zeros(2, 1, 7, 7, device=device).masked_fill(
+            future,
+            float("-inf"),
+        )
+
+        actual = TritonExecutor(strict=True).run(
+            module,
+            [query_tensor, key_tensor, value_tensor, mask_tensor],
+        ).outputs[0]
+        expected = _reference_attention(
+            query_tensor,
+            key_tensor,
+            value_tensor,
+            mask_tensor,
+            64**-0.5,
+        )
+
+        self.assertTrue(torch.equal(actual, expected))
+
 
 if __name__ == "__main__":
     unittest.main()

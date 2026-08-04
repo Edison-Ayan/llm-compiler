@@ -154,6 +154,166 @@ class KernelIRLoweringTest(unittest.TestCase):
             {"kernel.cublas.linear": 1},
         )
 
+    def test_pytorch_compatible_mode_selects_explicit_cuda_kernels(
+        self,
+    ) -> None:
+        query_type = TensorType(
+            (
+                StaticDim(2),
+                StaticDim(4),
+                StaticDim(3),
+                StaticDim(8),
+            ),
+            "bf16",
+            "cuda:0",
+        )
+        key_type = TensorType(
+            (
+                StaticDim(2),
+                StaticDim(2),
+                StaticDim(3),
+                StaticDim(8),
+            ),
+            "bf16",
+            "cuda:0",
+        )
+        position_type = TensorType(
+            (StaticDim(2), StaticDim(3), StaticDim(8)),
+            "bf16",
+            "cuda:0",
+        )
+        mask_type = TensorType(
+            (
+                StaticDim(2),
+                StaticDim(1),
+                StaticDim(3),
+                StaticDim(3),
+            ),
+            "f32",
+            "cuda:0",
+        )
+        builder = IRBuilder()
+        query = builder.argument(query_type, "query")
+        key = builder.argument(key_type, "key")
+        value = builder.argument(key_type, "value")
+        cosine = builder.argument(position_type, "cosine")
+        sine = builder.argument(position_type, "sine")
+        mask = builder.argument(mask_type, "mask")
+        rope = builder.emit(
+            "serve.rope",
+            [query, key, cosine, sine],
+            [query_type, key_type],
+            attributes={
+                "head_dim": 8,
+                "variant": "qwen2_half_rotation",
+            },
+        )
+        attention = builder.emit(
+            "serve.prefill_attention",
+            [rope.results[0], rope.results[1], value, mask],
+            [query_type],
+            attributes={"groups": 2, "scale": 8**-0.5, "causal": "mask"},
+        )
+        module = Module(
+            [Function("main", builder.block, attention.results)]
+        )
+
+        LowerToKernelIRPass(
+            numerical_mode="pytorch_compatible"
+        ).run(module)
+        coverage = analyze_lowering_coverage(module)
+
+        self.assertEqual(rope.name, "kernel.cuda.rope")
+        self.assertEqual(attention.name, "kernel.cuda.prefill_attention")
+        self.assertEqual(rope.attributes["numerical_mode"], "pytorch_compatible")
+        self.assertEqual(
+            attention.attributes["numerical_mode"],
+            "pytorch_compatible",
+        )
+        self.assertEqual(
+            coverage.lowered_by_name,
+            {
+                "kernel.cuda.prefill_attention": 1,
+                "kernel.cuda.rope": 1,
+            },
+        )
+
+    def test_pytorch_compatible_mode_sends_all_linear_to_cublas(self) -> None:
+        input_type = TensorType(
+            (StaticDim(2), StaticDim(1), StaticDim(896)),
+            "bf16",
+            "cuda:0",
+        )
+        weight_type = TensorType(
+            (StaticDim(896), StaticDim(896)),
+            "bf16",
+            "cuda:0",
+        )
+        builder = IRBuilder()
+        tensor = builder.argument(input_type, "input")
+        weight = builder.argument(weight_type, "weight")
+        output = builder.emit(
+            "serve.linear",
+            [tensor, weight],
+            [input_type],
+            attributes={
+                "input_features": 896,
+                "output_features": 896,
+                "has_bias": False,
+            },
+        )
+        module = Module([Function("main", builder.block, output.results)])
+
+        LowerToKernelIRPass(
+            numerical_mode="pytorch_compatible"
+        ).run(module)
+
+        self.assertEqual(output.name, "kernel.cublas.linear")
+        self.assertEqual(
+            output.attributes["backend_selection"],
+            "pytorch_compatible",
+        )
+
+    def test_pytorch_compatible_mode_selects_cuda_rms_norm(self) -> None:
+        tensor_type = TensorType(
+            (StaticDim(2), StaticDim(896)),
+            "bf16",
+            "cuda:0",
+        )
+        weight_type = TensorType(
+            (StaticDim(896),),
+            "bf16",
+            "cuda:0",
+        )
+        builder = IRBuilder()
+        tensor = builder.argument(tensor_type, "input")
+        weight = builder.argument(weight_type, "weight")
+        output = builder.emit(
+            "serve.rms_norm",
+            [tensor, weight],
+            [tensor_type],
+            attributes={
+                "epsilon": 1e-6,
+                "output_dtype": "bf16",
+                "round_before_weight": True,
+            },
+        )
+        module = Module([Function("main", builder.block, output.results)])
+
+        LowerToKernelIRPass(
+            numerical_mode="pytorch_compatible"
+        ).run(module)
+
+        self.assertEqual(output.name, "kernel.cuda.rms_norm")
+        self.assertEqual(
+            output.attributes["numerical_mode"],
+            "pytorch_compatible",
+        )
+
+    def test_lowering_rejects_unknown_numerical_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "不支持数值模式"):
+            LowerToKernelIRPass(numerical_mode="unknown")
+
     def test_strict_executor_rejects_aten_before_execution(self) -> None:
         tensor_type = TensorType((StaticDim(2),), "f32")
         builder = IRBuilder()

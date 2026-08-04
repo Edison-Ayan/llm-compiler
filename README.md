@@ -2,7 +2,7 @@
 
 面向动态、有状态 LLM Serving 工作负载的研究型编译器。
 
-当前已经完成十八个里程碑：
+当前已经完成十九个里程碑：
 
 1. 使用 `torch.export` 捕获带动态 Batch/序列长度的 Qwen 风格 Decoder；
 2. 将 Functional ATen 图导入自研 ServeIR，显式建模 SSA、动态类型和 KV 副作用；
@@ -33,7 +33,10 @@
     Kernel，按Decode/Prefill选择调度变体，相比TorchInductor几何平均加速1.247×；
 18. 加载真实Qwen2-0.5B BF16 Checkpoint，在24层、4.94亿参数上完成官方模型零误差
     权重转换，以及状态化Prefill到两步连续Decode；引入Triton/cuBLAS显式Linear后端选择，
-    并记录整图覆盖率、数值误差、执行时间和显存峰值。
+    并记录整图覆盖率、数值误差、执行时间和显存峰值；
+19. 增加`fast`与`pytorch_compatible`双数值模式，在KernelIR中显式区分融合Triton和
+    保留BF16舍入边界的CUDA复合后端；兼容模式在真实24层Prefill及两步Decode上实现
+    Logits和全部KV Cache逐元素零误差。
 
 项目仍保持 CPU 可运行；GPU Profile、Triton Kernel 和运行时分派是可选能力。
 
@@ -209,8 +212,9 @@ PYTHONPATH=src python benchmarks/bench_rope.py \
 ```bash
 PYTHONPATH=src python benchmarks/validate_qwen2_checkpoint.py \
   --local-files-only \
+  --numerical-mode pytorch_compatible \
   --decode-steps 2 \
-  --out artifacts/qwen2_0_5b_validation.json
+  --out artifacts/qwen2_0_5b_compatible_validation.json
 ```
 
 首次运行如本地没有权重，可移除`--local-files-only`。该脚本需要CUDA GPU及
@@ -258,6 +262,8 @@ attention_mask: [batch, 1, sequence, sequence]
   TorchInductor性能对比。
 - `docs/qwen2-0.5b-validation.md`：真实24层Qwen2-0.5B权重转换、整图编译、
   多步Decode、覆盖率与BF16数值审计。
+- `docs/numerical-modes.md`：融合Triton与PyTorch兼容CUDA后端的数值契约、
+  KernelIR选择和真实24层逐层误差定位。
 
 ## 当前边界
 
@@ -283,6 +289,7 @@ Qwen2ForCausalLM Prefill已经从Input IDs导出到Logits和多层KV Cache；15�
 4.830×、相比TorchInductor加速1.247×。Embedding、SwiGLU和Cosine/Sine生成仍未完成
 后端化。真实Qwen2-0.5B已经完成24层BF16官方权重零误差转换，并运行状态化Prefill和
 两步连续Decode；真实Prefill覆盖291/738（39.43%），Decode覆盖338/760（44.47%）。
-编译路径Top-1与项目Eager一致，但Triton RoPE/Attention的BF16累加顺序使结果尚非
-逐元素零误差，详细边界见`docs/qwen2-0.5b-validation.md`。
+融合Triton路径Top-1与项目Eager一致，但BF16舍入顺序使结果尚非逐元素零误差；新增的
+`pytorch_compatible`模式在相同真实模型上已实现Prefill、两步Decode和全部KV逐元素
+零误差。详细边界见`docs/numerical-modes.md`。
 Paged KV Cache、Block Table和长上下文Split-Sequence属于后续阶段。

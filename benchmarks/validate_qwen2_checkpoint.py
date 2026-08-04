@@ -98,6 +98,15 @@ def _state_max_error(state, expected) -> float:
     return _cache_max_error(actual, expected)
 
 
+def _state_layer_errors(state, expected) -> list[float]:
+    """按Decoder层报告物理KV状态与逻辑参考Cache的最大误差。"""
+
+    return [
+        _cache_max_error((state.read(slot),), (expected_pair,))
+        for slot, expected_pair in enumerate(expected)
+    ]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen2-0.5B")
@@ -108,6 +117,11 @@ def main() -> None:
     parser.add_argument("--max-batch", type=int, default=4)
     parser.add_argument("--capacity", type=int, default=8)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--numerical-mode",
+        choices=("fast", "pytorch_compatible"),
+        default="fast",
+    )
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument(
         "--out",
@@ -216,6 +230,7 @@ def main() -> None:
         project_prefill_logits, project_prefill_cache = project(*gpu_inputs)
         project_decode_cache = project_prefill_cache
         project_decode_logits_by_step = []
+        project_decode_cache_by_step = []
         for step in range(args.decode_steps):
             current_length = args.prompt_tokens + step
             project_decode_logits, project_decode_cache = project.decode(
@@ -237,6 +252,9 @@ def main() -> None:
             )
             project_decode_logits_by_step.append(
                 project_decode_logits.detach().cpu()
+            )
+            project_decode_cache_by_step.append(
+                _copy_project_cache(project_decode_cache)
             )
     project_peak_mib = torch.cuda.max_memory_allocated() / 1024**2
     eager_prefill_logit_error = float(
@@ -279,6 +297,7 @@ def main() -> None:
                 function_name="prefill",
                 prefill_kv_state=True,
                 kv_capacity=args.capacity,
+                numerical_mode=args.numerical_mode,
             ),
         )
     )
@@ -333,12 +352,15 @@ def main() -> None:
                 function_name="decode",
                 preallocate_kv=True,
                 kv_capacity=args.capacity,
+                numerical_mode=args.numerical_mode,
             ),
         )
     )
     torch.cuda.reset_peak_memory_stats()
     decode_step_seconds = []
     compiled_decode_logits_by_step = []
+    compiled_decode_cache_errors = []
+    compiled_decode_layer_cache_errors = []
     with torch.no_grad():
         for step in range(args.decode_steps):
             current_length = args.prompt_tokens + step
@@ -376,6 +398,18 @@ def main() -> None:
             compiled_decode_logits_by_step.append(
                 compiled_decode_logits.detach().cpu()
             )
+            compiled_decode_cache_errors.append(
+                _state_max_error(
+                    state,
+                    project_decode_cache_by_step[step],
+                )
+            )
+            compiled_decode_layer_cache_errors.append(
+                _state_layer_errors(
+                    state,
+                    project_decode_cache_by_step[step],
+                )
+            )
     decode_peak_mib = torch.cuda.max_memory_allocated() / 1024**2
 
     compiled_prefill_diff = (
@@ -410,6 +444,12 @@ def main() -> None:
         "schema_version": 1,
         "model": args.model,
         "dtype": args.dtype,
+        "numerical_mode": args.numerical_mode,
+        "numerical_contract": (
+            "bitwise_eager"
+            if args.numerical_mode == "pytorch_compatible"
+            else "top1_and_state"
+        ),
         "parameter_count": parameter_count,
         "config": {
             "layers": project.config.num_layers,
@@ -484,6 +524,10 @@ def main() -> None:
                 for difference in compiled_decode_diffs
             ],
             "step_top1_equal": compiled_decode_step_top1,
+            "step_cache_max_abs_error": compiled_decode_cache_errors,
+            "step_layer_cache_max_abs_error": (
+                compiled_decode_layer_cache_errors
+            ),
             "top1_equal": all(compiled_decode_step_top1),
             "cache_max_abs_error": _state_max_error(
                 state,
@@ -493,6 +537,20 @@ def main() -> None:
             "lengths_correct": lengths_correct,
         },
     }
+    compatible_exact = bool(
+        payload["compiled_prefill"]["logit_max_abs_error"] == 0.0
+        and payload["compiled_prefill"]["cache_max_abs_error"] == 0.0
+        and payload["compiled_decode"]["logit_max_abs_error"] == 0.0
+        and payload["compiled_decode"]["cache_max_abs_error"] == 0.0
+    )
+    payload["numerical_contract_passed"] = bool(
+        compatible_exact
+        if args.numerical_mode == "pytorch_compatible"
+        else (
+            payload["compiled_prefill"]["top1_equal"]
+            and payload["compiled_decode"]["top1_equal"]
+        )
+    )
     payload["passed"] = bool(
         eager_prefill_logit_error == 0.0
         and eager_prefill_cache_error == 0.0
@@ -502,6 +560,7 @@ def main() -> None:
         and payload["compiled_decode"]["top1_equal"]
         and buffer_addresses_stable
         and lengths_correct
+        and payload["numerical_contract_passed"]
     )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

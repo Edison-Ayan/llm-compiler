@@ -17,12 +17,23 @@ from .pass_manager import CompilerPass, PassResult
 # 后续可以在不改变前端和高层优化 Pass 的前提下，为这些操作增加 Launch 配置、
 # Workspace 和内存布局等更底层的信息。
 _KERNEL_LOWERINGS = {
-    "serve.prefill_attention": "kernel.triton.prefill_attention",
-    "serve.rms_norm": "kernel.triton.rms_norm",
-    "serve.rope": "kernel.triton.rope",
     "serve.kv.store": "kernel.triton.kv_store",
     "serve.kv.prefill_store": "kernel.triton.kv_prefill_store",
-    "serve.decode_attention": "kernel.triton.decode_attention",
+}
+
+_NUMERICAL_LOWERINGS = {
+    "fast": {
+        "serve.rms_norm": "kernel.triton.rms_norm",
+        "serve.prefill_attention": "kernel.triton.prefill_attention",
+        "serve.rope": "kernel.triton.rope",
+        "serve.decode_attention": "kernel.triton.decode_attention",
+    },
+    "pytorch_compatible": {
+        "serve.rms_norm": "kernel.cuda.rms_norm",
+        "serve.prefill_attention": "kernel.cuda.prefill_attention",
+        "serve.rope": "kernel.cuda.rope",
+        "serve.decode_attention": "kernel.cuda.decode_attention",
+    },
 }
 
 _RUNTIME_LOWERINGS = {
@@ -35,6 +46,10 @@ _EXECUTABLE_OPERATIONS = frozenset(
     _KERNEL_LOWERINGS.values()
 ) | frozenset(_RUNTIME_LOWERINGS.values()) | frozenset(
     {"kernel.triton.linear", "kernel.cublas.linear"}
+) | frozenset(
+    target
+    for lowering in _NUMERICAL_LOWERINGS.values()
+    for target in lowering.values()
 )
 
 
@@ -78,15 +93,29 @@ class LowerToKernelIRPass(CompilerPass):
 
     name = "lower-to-kernel-ir"
 
+    def __init__(self, *, numerical_mode: str = "fast") -> None:
+        if numerical_mode not in _NUMERICAL_LOWERINGS:
+            supported = ", ".join(sorted(_NUMERICAL_LOWERINGS))
+            raise ValueError(
+                f"不支持数值模式{numerical_mode}，可选值：{supported}"
+            )
+        self.numerical_mode = numerical_mode
+
     def run(self, module: Module) -> PassResult:
         lowered = Counter()
         for function in module.functions:
             for operation in function.block.operations:
                 source_name = operation.name
                 target_name = (
-                    _select_linear_backend(operation)
+                    _select_linear_backend(
+                        operation,
+                        self.numerical_mode,
+                    )
                     if source_name == "serve.linear"
-                    else _KERNEL_LOWERINGS.get(source_name)
+                    else _select_kernel_backend(
+                        source_name,
+                        self.numerical_mode,
+                    )
                 )
                 if target_name is None:
                     target_name = _RUNTIME_LOWERINGS.get(source_name)
@@ -96,6 +125,10 @@ class LowerToKernelIRPass(CompilerPass):
                 operation.name = target_name
                 # 保留来源便于调试 KernelIR，同时不影响 SSA 和副作用信息。
                 operation.attributes["lowered_from"] = source_name
+                if source_name in _NUMERICAL_LOWERINGS["fast"]:
+                    operation.attributes["numerical_mode"] = (
+                        self.numerical_mode
+                    )
                 lowered[f"{source_name}->{target_name}"] += 1
 
         coverage = analyze_lowering_coverage(module)
@@ -110,11 +143,23 @@ class LowerToKernelIRPass(CompilerPass):
         )
 
 
-def _select_linear_backend(operation) -> str:
+def _select_kernel_backend(source_name: str, numerical_mode: str) -> str | None:
+    """按数值策略选择融合Triton核或保留官方舍入边界的CUDA路径。"""
+
+    numerical_target = _NUMERICAL_LOWERINGS[numerical_mode].get(source_name)
+    if numerical_target is not None:
+        return numerical_target
+    return _KERNEL_LOWERINGS.get(source_name)
+
+
+def _select_linear_backend(operation, numerical_mode: str) -> str:
     """大静态GEMM交给cuBLAS，小M研究路径继续使用Triton。"""
 
     input_features = operation.attributes.get("input_features")
     output_features = operation.attributes.get("output_features")
+    if numerical_mode == "pytorch_compatible":
+        operation.attributes["backend_selection"] = "pytorch_compatible"
+        return "kernel.cublas.linear"
     if (
         isinstance(input_features, int)
         and isinstance(output_features, int)

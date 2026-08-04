@@ -85,6 +85,9 @@ Qwen2-0.5B中73个Linear选择cuBLAS路径，包括每层Gate/Up/Down Projection
 `torch.nn.functional.linear`进入CUDA库实现，所以它是一个可审计的库调用Lowering
 原型，还不是直接调用cuBLAS C API的独立Runtime。这个边界会在后续Runtime层完善。
 
+以上是`fast`模式的Shape规则。`pytorch_compatible`模式会把全部169个Linear送入
+`kernel.cublas.linear`，避免小Linear Triton路径在未覆盖输入上产生BF16位差异。
+
 ## Qwen2 覆盖率变化（Linear里程碑当时）
 
 两层 Qwen2 Decode 优化后仍为111个操作：

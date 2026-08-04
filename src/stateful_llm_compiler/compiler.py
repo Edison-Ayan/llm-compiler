@@ -32,6 +32,7 @@ class CompileOptions:
     kv_capacity: int | None = None
     require_full_lowering: bool = False
     prefill_kv_state: bool = False
+    numerical_mode: str = "fast"
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,7 @@ def compile_exported_program(
         kv_capacity=options.kv_capacity,
         lower_to_kernel_ir=True,
         prefill_kv_state=options.prefill_kv_state,
+        numerical_mode=options.numerical_mode,
     ).run(module)
     coverage = analyze_lowering_coverage(module)
     if options.require_full_lowering:

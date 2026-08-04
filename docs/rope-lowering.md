@@ -96,7 +96,10 @@ Prefill、Decode、KV状态衔接及Hugging Face差分测试也全部通过。
 真实Qwen2-0.5B BF16审计发现，Triton RoPE与官方Eager会因融合乘加和中间舍入顺序
 产生最多约一个到两个BF16量化步长的局部差异；差异继续经过24层Attention后会放大。
 因此上面的专项FP16/FP32正确性不能外推成BF16逐元素零误差，真实整图结果单独记录在
-`qwen2-0.5b-validation.md`。
+`qwen2-0.5b-validation.md`。编译器现在提供`pytorch_compatible`模式，把RoPE Lower为
+显式`kernel.cuda.rope`复合路径，保留Mul和Add之间的BF16物化边界；真实24层两步
+Decode验证为逐元素零误差。该路径不是单Launch Triton实现，详细权衡见
+`numerical-modes.md`。
 
 ## RTX 4060性能结果
 

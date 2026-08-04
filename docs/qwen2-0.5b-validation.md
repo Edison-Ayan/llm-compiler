@@ -75,7 +75,7 @@ Decode第2步Logits最大误差：    0
 ## Linear后端选择
 
 真实模型还暴露出初版Triton GEMM在`4864→896`等大归约BF16形状上的误差会明显放大。
-逐节点审计发现，169个Linear中只有24个`down_proj`出现显著差异。当前Lowering把后端
+逐节点审计发现，169个Linear中只有24个`down_proj`出现显著差异。`fast`模式把后端
 选择显式写入KernelIR：
 
 ```text
@@ -89,6 +89,9 @@ Q/K/V/O Projection。`kernel.cublas.linear`目前由执行器调用`F.linear`进
 Runtime，避免执行器层依赖PyTorch API。
 
 ## 真实整图覆盖率
+
+以下后端构成对应`fast`模式；兼容模式的总操作和覆盖率相同，但会把169个Linear全部
+交给cuBLAS，并把RMSNorm、RoPE和Attention改为`kernel.cuda.*`。
 
 状态化Prefill：
 
@@ -140,9 +143,22 @@ Triton RoPE + 参考Attention：       最大误差0.21875
 参考RoPE + 参考Attention：          最大误差0
 ```
 
-因此剩余差异来自Triton RoPE和Attention在BF16下的融合乘加、累加与中间舍入顺序；
-RMSNorm和当前选择后的Linear已经排除。Top-1一致说明链路可运行，但下一阶段仍需建立
-明确的精度预算，并决定是复刻官方舍入、在关键位置提高精度，还是采用端到端容差标准。
+因此Prefill的主要差异来自Triton RoPE和Attention在BF16下的融合乘加、累加与中间
+舍入顺序。进一步执行两步Decode时还发现，Triton RMSNorm会在第2步第16层首次产生
+`0.015625`偏差，并被后续层放大到`0.125`。单个样例逐位一致不能证明BF16 Kernel
+对所有输入逐位兼容。
+
+现在编译器提供两种明确数值契约：
+
+```text
+fast：                融合Triton/cublas混合路径，记录误差并要求Top-1和状态不变量
+pytorch_compatible：  保留官方CUDA舍入边界，要求Logits和KV逐元素零误差
+```
+
+真实24层兼容模式结果：Prefill Logits/KV、两步Decode Logits、每一步全部24层K/V的
+最大误差均为0。兼容模式使用169个cuBLAS Linear，以及显式的`kernel.cuda.rms_norm`、
+`kernel.cuda.rope`和`kernel.cuda.*_attention`复合操作。它仍依赖PyTorch CUDA Runtime，
+不是自研Triton单核逐位兼容。完整设计见`numerical-modes.md`。
 
 ## 时间与显存
 
@@ -169,8 +185,9 @@ RMSNorm和当前选择后的Linear已经排除。Top-1一致说明链路可运�
 ```bash
 PYTHONPATH=src python benchmarks/validate_qwen2_checkpoint.py \
   --local-files-only \
+  --numerical-mode pytorch_compatible \
   --decode-steps 2 \
-  --out artifacts/qwen2_0_5b_validation.json
+  --out artifacts/qwen2_0_5b_compatible_validation.json
 ```
 
 脚本的硬通过条件包括：官方与项目Eager逐元素零误差、每一步编译Decode的Top-1一致、
@@ -182,6 +199,6 @@ KV Buffer地址稳定以及所有层Length正确。详细原始结果写入指�
 
 1. 融合并Lower SwiGLU，减少每层`SiLU + Mul`及相关中间Tensor；
 2. 把View、Transpose、Reshape和Cast归入Metadata/Conversion Dialect；
-3. 为RoPE和Attention建立BF16逐算子误差预算与可选择高精度变体；
+3. 对双数值模式做长Prompt、稳态Decode性能测试并接入逐算子成本模型；
 4. 将Embedding和RoPE Cache后端化，继续降低整图回退数量；
 5. 在更长Prompt、更多Decode步数上做预热后的TorchInductor对照Benchmark。

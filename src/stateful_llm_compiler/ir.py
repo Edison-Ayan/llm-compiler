@@ -266,6 +266,11 @@ def _verify_function(function: Function, errors: list[str]) -> None:
         _verify_linear_operation(operation, errors)
         _verify_rope_operation(operation, errors)
         _verify_prefill_attention(operation, errors)
+        if operation.name in {
+            "kernel.triton.decode_attention",
+            "kernel.cuda.decode_attention",
+        }:
+            _verify_decode_attention(operation, errors)
 
     for returned in function.returns:
         if returned not in defined:
@@ -538,6 +543,7 @@ def _verify_prefill_attention(
     if operation.name not in {
         "serve.prefill_attention",
         "kernel.triton.prefill_attention",
+        "kernel.cuda.prefill_attention",
     }:
         return
     if len(operation.operands) != 4 or len(operation.results) != 1:
@@ -609,7 +615,11 @@ def _verify_rope_operation(
 ) -> None:
     """验证Qwen2半维旋转RoPE的Shape、DType和双结果契约。"""
 
-    if operation.name not in {"serve.rope", "kernel.triton.rope"}:
+    if operation.name not in {
+        "serve.rope",
+        "kernel.triton.rope",
+        "kernel.cuda.rope",
+    }:
         return
     if len(operation.operands) != 4 or len(operation.results) != 2:
         errors.append(

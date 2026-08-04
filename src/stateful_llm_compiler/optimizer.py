@@ -37,6 +37,7 @@ def default_pass_manager(
     kv_capacity: int | None = None,
     lower_to_kernel_ir: bool = False,
     prefill_kv_state: bool = False,
+    numerical_mode: str = "fast",
 ) -> PassManager:
     passes = [
         RemoveExportAssertionsPass(),
@@ -57,7 +58,9 @@ def default_pass_manager(
     if cost_model is not None:
         passes.append(SelectRMSNormLoweringPass(cost_model))
     if lower_to_kernel_ir:
-        passes.append(LowerToKernelIRPass())
+        passes.append(
+            LowerToKernelIRPass(numerical_mode=numerical_mode)
+        )
     return PassManager(passes)
 
 
@@ -104,6 +107,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="要求 KernelIR 零 ATen/参考执行器回退",
     )
+    parser.add_argument(
+        "--numerical-mode",
+        choices=("fast", "pytorch_compatible"),
+        default="fast",
+        help="选择融合快速路径或保留PyTorch BF16舍入边界的兼容路径",
+    )
     return parser
 
 
@@ -124,6 +133,7 @@ def main() -> None:
         lower_to_kernel_ir=(
             args.lower_kernel_ir or args.require_full_lowering
         ),
+        numerical_mode=args.numerical_mode,
     ).run(module)
     if args.require_full_lowering:
         require_full_lowering(module)

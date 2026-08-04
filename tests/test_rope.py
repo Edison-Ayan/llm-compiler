@@ -225,6 +225,70 @@ class TritonRoPETest(unittest.TestCase):
             atol=2e-6,
         )
 
+    def test_pytorch_compatible_mode_is_bf16_bitwise_equal(self) -> None:
+        device = str(torch.device("cuda", torch.cuda.current_device()))
+        builder = IRBuilder()
+        query_type = TensorType(
+            (StaticDim(2), StaticDim(14), StaticDim(7), StaticDim(64)),
+            "bf16",
+            device,
+        )
+        key_type = TensorType(
+            (StaticDim(2), StaticDim(2), StaticDim(7), StaticDim(64)),
+            "bf16",
+            device,
+        )
+        position_type = TensorType(
+            (StaticDim(2), StaticDim(7), StaticDim(64)),
+            "bf16",
+            device,
+        )
+        query = builder.argument(query_type, "query")
+        key = builder.argument(key_type, "key")
+        cosine = builder.argument(position_type, "cosine")
+        sine = builder.argument(position_type, "sine")
+        rope = builder.emit(
+            "serve.rope",
+            [query, key, cosine, sine],
+            [query_type, key_type],
+            attributes={
+                "head_dim": 64,
+                "variant": "qwen2_half_rotation",
+            },
+        )
+        module = Module([Function("main", builder.block, rope.results)])
+        LowerToKernelIRPass(
+            numerical_mode="pytorch_compatible"
+        ).run(module)
+        torch.manual_seed(2026)
+        query_tensor = torch.randn(
+            2, 14, 7, 64, device=device, dtype=torch.bfloat16
+        )
+        key_tensor = torch.randn(
+            2, 2, 7, 64, device=device, dtype=torch.bfloat16
+        )
+        angles = torch.randn(2, 7, 64, device=device)
+        cosine_tensor = angles.cos().bfloat16()
+        sine_tensor = angles.sin().bfloat16()
+
+        actual_query, actual_key = TritonExecutor(strict=True).run(
+            module,
+            [query_tensor, key_tensor, cosine_tensor, sine_tensor],
+        ).outputs
+
+        self.assertTrue(
+            torch.equal(
+                actual_query,
+                _reference_rope(query_tensor, cosine_tensor, sine_tensor),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                actual_key,
+                _reference_rope(key_tensor, cosine_tensor, sine_tensor),
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
