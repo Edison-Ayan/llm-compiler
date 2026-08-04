@@ -3,8 +3,9 @@
 ## 目标
 
 早期 `StatefulTinyDecoder` 只复现了 GQA、RMSNorm、SwiGLU 和 KV Cache 的基本形状，
-不能证明编译器能够处理真实模型语义。本阶段以本地 `transformers 5.9.0` 的
-`Qwen2Model` 为参考，建立不下载权重也可以重复执行的随机权重差分测试。
+不能证明编译器能够处理真实模型语义。本阶段先以本地 `transformers 5.9.0` 的
+`Qwen2Model` 建立不下载权重也可以重复执行的随机权重差分测试，随后又加载真实
+Qwen2-0.5B BF16 Checkpoint完成24层验证。
 
 项目实现位于`src/stateful_llm_compiler/qwen2.py`。`StatefulQwen2Model`保留直接接收
 Input Embedding的Decoder边界；`StatefulQwen2ForCausalLM`进一步加入Token Embedding
@@ -46,20 +47,16 @@ Layer 0/1 Present Value
 
 ## 编译链
 
-Qwen2 两层单 Token Decode 导出 253 个 FX Node，导入得到 219 个 ServeIR Operation，
+Qwen2 两层单 Token Decode 导入得到 209 个 ServeIR Operation，
 且没有 `serve.external` fallback。优化过程为：
 
 ```text
-导入：                       219
-删除断言与死 Shape 元数据：  157
-融合 5 个 RMSNorm：          127
-恢复两个 KV Slot：           127
-Bufferize 两个 KV Append：   131
-融合两个 Decode Attention：  111
-Lower 5个 RMSNorm、14个 Linear、2个 KV Store、2个 Attention和4个 Runtime操作：111
+导入：                                       209
+融合RMSNorm、RoPE、Decode Attention并物化KV状态
+优化及Lower后的KernelIR：                     76
 ```
 
-当前29/81个操作已经进入 KernelIR 后端，覆盖率为35.80%；剩余52个操作会由严格
+当前29/76个操作已经进入 KernelIR 后端，覆盖率为38.16%；剩余47个操作会由严格
 模式准确报告，不能再把参考执行器回退当成完整编译。
 
 Qwen2 使用：
@@ -82,6 +79,10 @@ ATen 语义。`inv_freq` 是 `persistent=False` Buffer，参数绑定器会从
 - 包含14个 Triton Linear的 KernelIR GPU路径通过 `3e-5` 精度差分；
 - 两个 Attention 都被融合，并直接消费物理 KV Buffer。
 
+真实Qwen2-0.5B进一步验证了24层、494,032,768个参数的映射。官方模型与项目Eager的
+Prefill Logits、两步Decode Logits及所有层K/V均逐元素零误差。编译路径的BF16误差、
+整图覆盖率和资源数据见`qwen2-0.5b-validation.md`。
+
 运行：
 
 ```bash
@@ -98,8 +99,9 @@ pip install -e '.[gpu,hf]'
 ## 当前边界
 
 - 已捕获Input IDs、Embedding和LM Head，但Embedding仍未Lower到后端；
-- 通过随机初始化官方模型验证映射，尚未加载公开预训练权重；
+- 已加载Qwen2-0.5B公开预训练权重；更大Qwen2模型尚未验证；
 - 只支持默认 RoPE、Full Attention 和 SiLU；
 - 已导出动态多Token Prefill并验证Tensor Cache衔接Decode，尚未统一物理状态ABI；
 - 仍使用连续 KV Buffer，尚未实现 Paged KV 和 Block Table；
-- 当前是两层小配置正确性实验，不是完整 Qwen2 端到端 Tokens/s Benchmark。
+- 两层小配置仍作为快速回归测试；真实模型脚本目前是首轮执行验证，不是稳定态
+  Tokens/s Benchmark。

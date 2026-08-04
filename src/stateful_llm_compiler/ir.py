@@ -463,6 +463,7 @@ def _verify_linear_operation(
     if operation.name not in {
         "serve.linear",
         "kernel.triton.linear",
+        "kernel.cublas.linear",
     }:
         return
     if len(operation.operands) not in {2, 3}:

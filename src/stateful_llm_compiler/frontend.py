@@ -155,6 +155,11 @@ def export_qwen2_stateful_decode(
 ) -> torch.export.ExportedProgram:
     """导出带 Position ID、RoPE 和多层 Cache 的 Qwen2 单 Token Decode。"""
 
+    _validate_qwen2_dynamic_batch_example(
+        example_inputs[0],
+        max_batch,
+        "Qwen2 Decode",
+    )
     past_key_values = example_inputs[3]
     if len(past_key_values) != model.config.num_layers:
         raise ValueError("导出输入的 KV Slot 数量与 Qwen2 模型层数不一致")
@@ -198,6 +203,11 @@ def export_qwen2_causal_lm_prefill(
 ) -> torch.export.ExportedProgram:
     """捕获从Input IDs到Logits和多层KV Cache的动态Prefill整图。"""
 
+    _validate_qwen2_dynamic_batch_example(
+        example_inputs[0],
+        max_batch,
+        "Qwen2 Prefill",
+    )
     batch = torch.export.Dim("batch", min=1, max=max_batch)
     tokens = torch.export.Dim(
         "prompt_tokens",
@@ -231,6 +241,11 @@ def export_qwen2_causal_lm_decode(
 ) -> torch.export.ExportedProgram:
     """捕获Input IDs、状态化Decoder和LM Head组成的单Token整图。"""
 
+    _validate_qwen2_dynamic_batch_example(
+        example_inputs[0],
+        max_batch,
+        "Qwen2 CausalLM Decode",
+    )
     past_key_values = example_inputs[3]
     if len(past_key_values) != model.config.num_layers:
         raise ValueError("Decode输入的KV Slot数量与CausalLM层数不一致")
@@ -259,6 +274,21 @@ def export_qwen2_causal_lm_decode(
         dynamic_shapes=dynamic_shapes,
         strict=True,
     )
+
+
+def _validate_qwen2_dynamic_batch_example(
+    primary_input: torch.Tensor,
+    max_batch: int,
+    context: str,
+) -> None:
+    """避免PyTorch把Batch=1样例特化后再报告难以理解的约束错误。"""
+
+    sample_batch = int(primary_input.shape[0])
+    if sample_batch == 1 and max_batch > 1:
+        raise ValueError(
+            f"{context}声明动态Batch时，导出样例Batch必须至少为2；"
+            "Batch=1会被PyTorch 2.8特化为静态维。导出后运行时仍可使用Batch=1。"
+        )
 
 
 def verify_export(

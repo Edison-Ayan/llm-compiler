@@ -169,7 +169,7 @@ class Qwen2CompatibilityTest(unittest.TestCase):
             if operation.name == "serve.decode_attention"
         ]
 
-        self.assertEqual(imported_operations, 219)
+        self.assertEqual(imported_operations, 209)
         self.assertNotIn("serve.external", names)
         self.assertEqual(results[-3].statistics["slots"], 2)
         self.assertEqual(results[-2].statistics["bufferized"], 2)
@@ -227,9 +227,9 @@ class Qwen2CompatibilityTest(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(artifact.coverage.total_operations, 81)
+        self.assertEqual(artifact.coverage.total_operations, 76)
         self.assertEqual(artifact.coverage.lowered_operations, 29)
-        self.assertEqual(artifact.coverage.unlowered_operations, 52)
+        self.assertEqual(artifact.coverage.unlowered_operations, 47)
         self.assertEqual(
             artifact.coverage.lowered_by_name,
             {
@@ -246,6 +246,11 @@ class Qwen2CompatibilityTest(unittest.TestCase):
             "aten.linear.default",
             artifact.coverage.unlowered_by_name,
         )
+
+    def test_bf16_conversion_preserves_fp32_rope_frequency(self) -> None:
+        model = copy.deepcopy(self.model).bfloat16()
+
+        self.assertEqual(model.rotary_emb.inv_freq.dtype, torch.float32)
 
     @unittest.skipUnless(torch.cuda.is_available(), "需要 CUDA GPU")
     def test_qwen2_bufferized_decode_runs_triton_on_gpu(self) -> None:

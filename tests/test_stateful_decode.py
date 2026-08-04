@@ -267,7 +267,7 @@ class KVStateCompilerTest(unittest.TestCase):
         self.assertEqual(lengths, [4, 5, 6, 7])
         self.assertEqual(state.generation, 4)
         self.assertEqual(original_key.shape[2], 3)
-        self.assertEqual(len(result.executed_operations), 45)
+        self.assertEqual(len(result.executed_operations), 43)
 
     def test_bufferization_generates_position_store_and_advance(self) -> None:
         module = self.make_module()
@@ -287,7 +287,7 @@ class KVStateCompilerTest(unittest.TestCase):
         self.assertEqual(names.count("serve.kv.store"), 1)
         self.assertEqual(names.count("serve.kv.advance"), 1)
         self.assertEqual(names.count("serve.decode_attention"), 1)
-        self.assertEqual(len(names), 37)
+        self.assertEqual(len(names), 35)
         advance = next(
             operation
             for operation in function.block.operations

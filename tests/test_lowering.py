@@ -113,6 +113,47 @@ class KernelIRLoweringTest(unittest.TestCase):
             {"kernel.triton.not_registered": 1},
         )
 
+    def test_large_static_linear_selects_cublas_backend(self) -> None:
+        input_type = TensorType(
+            (StaticDim(2), StaticDim(2), StaticDim(4864)),
+            "bf16",
+        )
+        weight_type = TensorType(
+            (StaticDim(896), StaticDim(4864)),
+            "bf16",
+        )
+        output_type = TensorType(
+            (StaticDim(2), StaticDim(2), StaticDim(896)),
+            "bf16",
+        )
+        builder = IRBuilder()
+        tensor = builder.argument(input_type, "input")
+        weight = builder.argument(weight_type, "weight")
+        output = builder.emit(
+            "serve.linear",
+            [tensor, weight],
+            [output_type],
+            attributes={
+                "input_features": 4864,
+                "output_features": 896,
+                "has_bias": False,
+            },
+        )
+        module = Module([Function("main", builder.block, output.results)])
+
+        LowerToKernelIRPass().run(module)
+        coverage = analyze_lowering_coverage(module)
+
+        self.assertEqual(output.name, "kernel.cublas.linear")
+        self.assertEqual(
+            output.attributes["backend_selection"],
+            "large_static_gemm",
+        )
+        self.assertEqual(
+            coverage.lowered_by_name,
+            {"kernel.cublas.linear": 1},
+        )
+
     def test_strict_executor_rejects_aten_before_execution(self) -> None:
         tensor_type = TensorType((StaticDim(2),), "f32")
         builder = IRBuilder()

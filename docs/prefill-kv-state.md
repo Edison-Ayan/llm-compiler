@@ -85,20 +85,20 @@ serve.kv.prefill_store
 状态化Prefill编译统计：
 
 ```text
-优化计算图：                     80
-增加1个Init和2个Store：          83
+优化计算图：                     75
+增加1个Init和2个Store：          78
 已Lower：                        27
-未Lower：                        56
-覆盖率：                     32.53%
+未Lower：                        51
+覆盖率：                     34.62%
 ```
 
 完整CausalLM Decode：
 
 ```text
-总操作：83
+总操作：78
 已Lower：30
-未Lower：53
-覆盖率：36.14%
+未Lower：48
+覆盖率：38.46%
 ```
 
 ## 端到端状态传递验证

@@ -28,11 +28,14 @@ def _inductor_rms_norm(
     tensor: torch.Tensor,
     weight: torch.Tensor,
     epsilon: float,
+    round_before_weight: bool,
 ) -> torch.Tensor:
     """与 Benchmark 保持一致的 Inductor RMSNorm 计算图。"""
 
     variance = tensor.float().pow(2).mean(dim=-1, keepdim=True)
     normalized = tensor.float() * torch.rsqrt(variance + epsilon)
+    if round_before_weight:
+        return weight * normalized.to(tensor.dtype)
     return (normalized * weight.float()).to(tensor.dtype)
 
 
@@ -44,7 +47,7 @@ class TritonExecutor(ReferenceExecutor):
         self.strict = strict
         self.lowering_trace: list[dict[str, Any]] = []
         self._inductor_kernels: dict[
-            tuple[str, torch.dtype, int, float], Any
+            tuple[str, torch.dtype, int, float, bool], Any
         ] = {}
 
     def run(
@@ -78,6 +81,8 @@ class TritonExecutor(ReferenceExecutor):
             )
         if name == "kernel.triton.linear":
             return self._kernel_triton_linear(runtime_operands, attributes)
+        if name == "kernel.cublas.linear":
+            return self._kernel_cublas_linear(runtime_operands, attributes)
         if name == "kernel.triton.prefill_attention":
             return self._kernel_triton_prefill_attention(
                 runtime_operands,
@@ -123,6 +128,25 @@ class TritonExecutor(ReferenceExecutor):
                 "kernel.triton.linear 的 has_bias 与运行时参数不一致"
             )
         return triton_linear(tensor, weight, bias)
+
+    @staticmethod
+    def _kernel_cublas_linear(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> torch.Tensor:
+        """执行编译器显式选择的cuBLAS GEMM库调用。"""
+
+        if len(operands) not in {2, 3}:
+            raise ExecutionError(
+                "kernel.cublas.linear需要input、weight和可选bias"
+            )
+        tensor, weight = operands[:2]
+        bias = operands[2] if len(operands) == 3 else None
+        if bool(attributes.get("has_bias")) != (bias is not None):
+            raise ExecutionError(
+                "kernel.cublas.linear的has_bias与运行时参数不一致"
+            )
+        return F.linear(tensor, weight, bias)
 
     @staticmethod
     def _kernel_triton_prefill_attention(
@@ -204,6 +228,9 @@ class TritonExecutor(ReferenceExecutor):
             epsilon=float(attributes["epsilon"]),
             output_dtype=attributes.get("output_dtype"),
             num_warps=decision.num_warps,
+            round_before_weight=bool(
+                attributes.get("round_before_weight", False)
+            ),
         )
 
     def _serve_rms_norm(
@@ -232,6 +259,9 @@ class TritonExecutor(ReferenceExecutor):
 
         epsilon = float(attributes["epsilon"])
         output_dtype = attributes.get("output_dtype")
+        round_before_weight = bool(
+            attributes.get("round_before_weight", False)
+        )
         if decision.backend == "triton":
             return triton_rms_norm(
                 tensor,
@@ -239,8 +269,21 @@ class TritonExecutor(ReferenceExecutor):
                 epsilon=epsilon,
                 output_dtype=output_dtype,
                 num_warps=decision.num_warps,
+                round_before_weight=round_before_weight,
             )
         if decision.backend == "native":
+            if round_before_weight:
+                variance = tensor.float().pow(2).mean(
+                    dim=-1,
+                    keepdim=True,
+                )
+                normalized = tensor.float() * torch.rsqrt(
+                    variance + epsilon
+                )
+                return _cast_output(
+                    weight * normalized.to(tensor.dtype),
+                    output_dtype,
+                )
             output = F.rms_norm(
                 tensor,
                 (hidden_size,),
@@ -254,6 +297,7 @@ class TritonExecutor(ReferenceExecutor):
                 tensor.dtype,
                 hidden_size,
                 epsilon,
+                round_before_weight,
             )
             compiled = self._inductor_kernels.get(key)
             if compiled is None:
@@ -267,7 +311,12 @@ class TritonExecutor(ReferenceExecutor):
                 )
                 self._inductor_kernels[key] = compiled
             return _cast_output(
-                compiled(tensor, weight, epsilon),
+                compiled(
+                    tensor,
+                    weight,
+                    epsilon,
+                    round_before_weight,
+                ),
                 output_dtype,
             )
         raise ExecutionError(

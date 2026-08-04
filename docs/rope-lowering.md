@@ -93,6 +93,11 @@ Batch/Token/Head Dim：
 独立RoPE图能够在`TritonExecutor(strict=True)`下零回退执行。完整两层Qwen2的
 Prefill、Decode、KV状态衔接及Hugging Face差分测试也全部通过。
 
+真实Qwen2-0.5B BF16审计发现，Triton RoPE与官方Eager会因融合乘加和中间舍入顺序
+产生最多约一个到两个BF16量化步长的局部差异；差异继续经过24层Attention后会放大。
+因此上面的专项FP16/FP32正确性不能外推成BF16逐元素零误差，真实整图结果单独记录在
+`qwen2-0.5b-validation.md`。
+
 ## RTX 4060性能结果
 
 测试配置使用Qwen2-0.5B风格的14个Query Head、2个KV Head和64 Head Dim，FP16，
@@ -122,22 +127,22 @@ Triton / TorchInductor：1.247×
 两层完整CausalLM Prefill：
 
 ```text
-RoPE前：22 / 110 = 20.00%
-RoPE后：24 / 80  = 30.00%
+RoPE前：22 / 105 = 20.95%
+RoPE后：24 / 75  = 32.00%
 ```
 
 状态化Prefill：
 
 ```text
-RoPE前：25 / 113 = 22.12%
-RoPE后：27 / 83  = 32.53%
+RoPE前：25 / 108 = 23.15%
+RoPE后：27 / 78  = 34.62%
 ```
 
 完整CausalLM Decode：
 
 ```text
-RoPE前：28 / 113 = 24.78%
-RoPE后：30 / 83  = 36.14%
+RoPE前：28 / 108 = 25.93%
+RoPE后：30 / 78  = 38.46%
 ```
 
 覆盖率同时受“融合减少总节点数”和“新增两个已Lower节点”影响，因此不能简单理解为

@@ -40,7 +40,7 @@ Triton，其余 `aten.*` 节点直接由 PyTorch 执行。它适合先验证优�
 
 ```text
 serve.rms_norm         -> kernel.triton.rms_norm
-serve.linear           -> kernel.triton.linear
+serve.linear           -> kernel.triton.linear / kernel.cublas.linear
 serve.rope             -> kernel.triton.rope
 serve.prefill_attention -> kernel.triton.prefill_attention
 serve.kv.store         -> kernel.triton.kv_store
@@ -51,9 +51,12 @@ serve.kv.length        -> runtime.kv.length
 serve.kv.advance       -> runtime.kv.advance
 ```
 
-`kernel.triton.*` 是 GPU 计算，`runtime.*` 是 KV 状态和元数据操作。Linear当前使用
-Triton，未来也可以增加 `kernel.cublas.*` 作为成本模型候选；View/Reshape等纯元数据操作可以 Lower 为
-`kernel.metadata.*`。这两类都属于我们的编译后端，不属于 PyTorch eager 回退。
+`kernel.triton.*`和`kernel.cublas.*`是GPU计算，`runtime.*`是KV状态和元数据操作。
+Linear会根据静态矩阵形状选择后端：当前任一特征维达到4096时选择
+`kernel.cublas.linear`，其余选择`kernel.triton.linear`。前者由执行器显式调用
+PyTorch的`F.linear`进入CUDA库路径，是cuBLAS Dialect原型，尚未直接绑定底层cuBLAS
+API。View/Reshape等纯元数据操作后续可Lower为`kernel.metadata.*`。这些都属于编译
+后端选择，不应与未Lower ATen节点的兼容回退混为一谈。
 
 ## 覆盖率与严格模式
 

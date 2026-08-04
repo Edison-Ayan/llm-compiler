@@ -2,7 +2,7 @@
 
 面向动态、有状态 LLM Serving 工作负载的研究型编译器。
 
-当前已经完成十七个里程碑：
+当前已经完成十八个里程碑：
 
 1. 使用 `torch.export` 捕获带动态 Batch/序列长度的 Qwen 风格 Decoder；
 2. 将 Functional ATen 图导入自研 ServeIR，显式建模 SSA、动态类型和 KV 副作用；
@@ -28,9 +28,12 @@
 15. 将多Token GQA Attention融合为`serve.prefill_attention`并Lower到Triton Online
     Softmax Kernel，Prefill图从128降至110个操作，实测相比展开GQA几何平均加速3.281×；
 16. 将Prefill多层Tensor Cache物化为预分配状态并用Triton批量写入，完整CausalLM
-    Decode可在相同Buffer地址上从Length=T继续追加，实现阶段间零历史Cache复制。
+    Decode可在相同Buffer地址上从Length=T继续追加，实现阶段间零历史Cache复制；
 17. 将每层16个Qwen2 RoPE展开节点融合为双结果`serve.rope`并Lower到单Launch Triton
-    Kernel，按Decode/Prefill选择调度变体，相比TorchInductor几何平均加速1.247×。
+    Kernel，按Decode/Prefill选择调度变体，相比TorchInductor几何平均加速1.247×；
+18. 加载真实Qwen2-0.5B BF16 Checkpoint，在24层、4.94亿参数上完成官方模型零误差
+    权重转换，以及状态化Prefill到两步连续Decode；引入Triton/cuBLAS显式Linear后端选择，
+    并记录整图覆盖率、数值误差、执行时间和显存峰值。
 
 项目仍保持 CPU 可运行；GPU Profile、Triton Kernel 和运行时分派是可选能力。
 
@@ -201,6 +204,18 @@ PYTHONPATH=src python benchmarks/bench_rope.py \
   --out artifacts/rope_benchmark.json
 ```
 
+验证真实Qwen2-0.5B Checkpoint的转换、编译和连续推理：
+
+```bash
+PYTHONPATH=src python benchmarks/validate_qwen2_checkpoint.py \
+  --local-files-only \
+  --decode-steps 2 \
+  --out artifacts/qwen2_0_5b_validation.json
+```
+
+首次运行如本地没有权重，可移除`--local-files-only`。该脚本需要CUDA GPU及
+`transformers`，默认使用BF16、Batch 2、2 Token Prompt和2步Decode。
+
 运行测试：
 
 ```bash
@@ -241,6 +256,8 @@ attention_mask: [batch, 1, sequence, sequence]
 - `docs/prefill-kv-state.md`：Prefill状态化、批量KV Store和Decode共享物理ABI。
 - `docs/rope-lowering.md`：Qwen2 RoPE子图融合、双结果IR、动态Triton调度和
   TorchInductor性能对比。
+- `docs/qwen2-0.5b-validation.md`：真实24层Qwen2-0.5B权重转换、整图编译、
+  多步Decode、覆盖率与BF16数值审计。
 
 ## 当前边界
 
@@ -257,12 +274,15 @@ Buffer，六组配置相比原展开路径几何平均加速 1.545×；当前仍
 Layout。两层 Qwen2 兼容路径已无外部算子地导入 ServeIR 并完成 GPU 数值差分，但当前
 执行器仍会让未 Lower 的 ATen 节点走 PyTorch 参考实现，不能称为完整后端编译。新增的
 KernelIR 覆盖报告和 strict 模式已经把这部分缺口显式化。Qwen2中的14个Decode
-Linear和两层RoPE已全部 Lower 到 Triton，两层Decoder Decode的当前后端覆盖率为
-29/81（35.80%）。完整
+Linear和两层RoPE已全部进入显式GPU后端，两层Decoder Decode的当前后端覆盖率为
+29/76（38.16%）。完整
 Qwen2ForCausalLM Prefill已经从Input IDs导出到Logits和多层KV Cache；15个Linear和
 两个Prefill Attention及两层RoPE均进入Triton。状态化Prefill会创建同Decode一致的
 预分配KV Buffer并批量写入，Decode随后在原地址继续追加；状态化Prefill覆盖率为
-27/83（32.53%）。RoPE Kernel在RTX 4060六组配置中相比PyTorch Eager几何平均加速
+27/78（34.62%）。RoPE Kernel在RTX 4060六组配置中相比PyTorch Eager几何平均加速
 4.830×、相比TorchInductor加速1.247×。Embedding、SwiGLU和Cosine/Sine生成仍未完成
-后端化。
+后端化。真实Qwen2-0.5B已经完成24层BF16官方权重零误差转换，并运行状态化Prefill和
+两步连续Decode；真实Prefill覆盖291/738（39.43%），Decode覆盖338/760（44.47%）。
+编译路径Top-1与项目Eager一致，但Triton RoPE/Attention的BF16累加顺序使结果尚非
+逐元素零误差，详细边界见`docs/qwen2-0.5b-validation.md`。
 Paged KV Cache、Block Table和长上下文Split-Sequence属于后续阶段。

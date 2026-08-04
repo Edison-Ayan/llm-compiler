@@ -75,6 +75,23 @@ class TritonRMSNormTest(unittest.TestCase):
         )
         self.assertEqual(output.dtype, torch.float16)
 
+    def test_kernel_preserves_qwen2_bf16_rounding_order(self) -> None:
+        tensor = torch.randn(7, 896, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(896, device="cuda", dtype=torch.bfloat16)
+        variance = tensor.float().pow(2).mean(dim=-1, keepdim=True)
+        normalized = tensor.float() * torch.rsqrt(variance + 1e-6)
+        expected = weight * normalized.to(torch.bfloat16)
+
+        actual = triton_rms_norm(
+            tensor,
+            weight,
+            epsilon=1e-6,
+            output_dtype="bf16",
+            round_before_weight=True,
+        )
+
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
     def test_executor_dispatches_profile_variant(self) -> None:
         tensor = torch.randn(8, 64, device="cuda")
         weight = torch.randn(64, device="cuda")

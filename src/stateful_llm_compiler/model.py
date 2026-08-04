@@ -45,7 +45,10 @@ class RMSNorm(nn.Module):
         input_dtype = x.dtype
         variance = x.float().pow(2).mean(dim=-1, keepdim=True)
         normalized = x.float() * torch.rsqrt(variance + self.eps)
-        return (normalized * self.weight.float()).to(input_dtype)
+        # Hugging Face Qwen2先把归一化结果舍入回输入DType，再与同DType
+        # Weight相乘。BF16下如果把Weight乘法也保留在FP32，误差会随深层
+        # Decoder不断累积，真实24层模型的Logits将明显偏离官方实现。
+        return self.weight * normalized.to(input_dtype)
 
 
 class TinyDecoderBlock(nn.Module):

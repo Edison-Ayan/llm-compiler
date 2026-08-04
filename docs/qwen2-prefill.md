@@ -61,23 +61,20 @@ Prefill最少两个Token；单Token路径由Decode前端负责。
 两层、Hidden Size 32、词表128的测试模型：
 
 ```text
-torch.export FX Node：                235
-导入ServeIR：                         203
-删除断言与死Shape元数据：             158
-规范化15个Linear：                    158
-融合5个RMSNorm：                      128
-融合2个双结果RoPE：                    98
-融合2个Prefill Attention：             80
-Lower 15个Linear、5个RMSNorm、2个RoPE和2个Attention：80
+导入ServeIR：                         193
+规范化15个Linear并融合5个RMSNorm、
+2个双结果RoPE和2个Prefill Attention： 75
+Lower 15个Linear、5个RMSNorm、
+2个RoPE和2个Attention：               75
 ```
 
 当前KernelIR覆盖率：
 
 ```text
 已Lower： 24
-未Lower： 56
-总操作：  80
-覆盖率： 30.000%
+未Lower： 51
+总操作：  75
+覆盖率： 32.000%
 ```
 
 多TokenAttention已经融合为两个`kernel.triton.prefill_attention`。剩余缺口主要是

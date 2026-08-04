@@ -18,6 +18,7 @@ class RMSNormMatch:
     input: Value
     weight: Value
     epsilon: float
+    round_before_weight: bool
 
 
 class FuseRMSNormPass(CompilerPass):
@@ -46,6 +47,7 @@ class FuseRMSNormPass(CompilerPass):
                             "axis": -1,
                             "compute_dtype": "f32",
                             "output_dtype": _result_dtype(match.output),
+                            "round_before_weight": match.round_before_weight,
                         },
                         result_hint="rms_norm",
                     )
@@ -66,6 +68,9 @@ class FuseRMSNormPass(CompilerPass):
     def _find_match(self, function: Function) -> RMSNormMatch | None:
         analysis = UseDefAnalysis(function)
         for candidate in function.block.operations:
+            match = _match_official_weight_order(candidate, analysis)
+            if match is not None:
+                return match
             match = _match_from_output_cast(candidate, analysis)
             if match is not None:
                 return match
@@ -157,6 +162,88 @@ def _match_from_output_cast(
         input=input_for_mul,
         weight=weight_cast.results[0],
         epsilon=float(add_args[1]),
+        round_before_weight=False,
+    )
+
+
+def _match_official_weight_order(
+    weighted: Operation,
+    analysis: UseDefAnalysis,
+) -> RMSNormMatch | None:
+    """匹配Qwen2先舍入归一化结果、再乘同DType Weight的语义。"""
+
+    if not _is(weighted, "aten.mul.Tensor", operand_count=2):
+        return None
+    normalized_cast = _producer_named(
+        analysis,
+        weighted.operands[0],
+        "aten.to.dtype",
+    )
+    weight = weighted.operands[1]
+    if normalized_cast is None:
+        normalized_cast = _producer_named(
+            analysis,
+            weighted.operands[1],
+            "aten.to.dtype",
+        )
+        weight = weighted.operands[0]
+    if normalized_cast is None or len(normalized_cast.operands) != 1:
+        return None
+
+    normal_mul = analysis.producer(normalized_cast.operands[0])
+    if not _is(normal_mul, "aten.mul.Tensor", operand_count=2):
+        return None
+    rsqrt, input_for_mul = _split_producer(
+        normal_mul,
+        analysis,
+        "aten.rsqrt.default",
+    )
+    if rsqrt is None or input_for_mul is None:
+        return None
+    input_cast_2 = analysis.producer(input_for_mul)
+    if not _is(input_cast_2, "aten.to.dtype", operand_count=1):
+        return None
+
+    add = _single_producer(analysis, rsqrt, "aten.add.Tensor")
+    mean = _single_producer(analysis, add, "aten.mean.dim")
+    power = _single_producer(analysis, mean, "aten.pow.Tensor_Scalar")
+    if add is None or mean is None or power is None:
+        return None
+    input_cast_1 = _single_producer(analysis, power, "aten.to.dtype")
+    if input_cast_1 is None:
+        return None
+    same_cast_chain = input_cast_2.operands[0] is input_cast_1.results[0]
+    same_original_input = (
+        input_cast_2.operands[0] is input_cast_1.operands[0]
+    )
+    if not same_cast_chain and not same_original_input:
+        return None
+
+    power_args = _positional_args(power)
+    mean_args = _positional_args(mean)
+    add_args = _positional_args(add)
+    if len(power_args) < 2 or power_args[1] != 2:
+        return None
+    if len(mean_args) < 3 or mean_args[1] != [-1] or mean_args[2] is not True:
+        return None
+    if len(add_args) < 2 or not isinstance(add_args[1], (int, float)):
+        return None
+
+    return RMSNormMatch(
+        operations=[
+            power,
+            mean,
+            add,
+            rsqrt,
+            normal_mul,
+            normalized_cast,
+            weighted,
+        ],
+        output=weighted.results[0],
+        input=input_cast_2.operands[0],
+        weight=weight,
+        epsilon=float(add_args[1]),
+        round_before_weight=True,
     )
 
 

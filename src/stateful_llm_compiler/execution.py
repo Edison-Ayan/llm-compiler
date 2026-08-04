@@ -687,6 +687,8 @@ class ReferenceExecutor:
         normalized = tensor.float() * torch.rsqrt(variance + epsilon)
         output_dtype = attributes.get("output_dtype")
         torch_dtype = _DTYPES.get(output_dtype, tensor.dtype)
+        if bool(attributes.get("round_before_weight", False)):
+            return weight * normalized.to(torch_dtype)
         return (normalized * weight.float()).to(torch_dtype)
 
     @staticmethod

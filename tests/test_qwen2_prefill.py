@@ -139,7 +139,7 @@ class Qwen2PrefillTest(unittest.TestCase):
             for operation in module.functions[0].block.operations
         ]
 
-        self.assertEqual(len(imported_names), 203)
+        self.assertEqual(len(imported_names), 193)
         self.assertNotIn("serve.external", imported_names)
         self.assertFalse(any("empty" in name for name in imported_names))
         self.assertEqual(imported_names.count("aten.embedding.default"), 1)
@@ -147,13 +147,28 @@ class Qwen2PrefillTest(unittest.TestCase):
         self.assertEqual(results[2].statistics["fused"], 5)
         self.assertEqual(results[3].statistics["fused"], 2)
         self.assertEqual(results[4].statistics["fused"], 2)
-        self.assertEqual(len(optimized_names), 80)
+        self.assertEqual(len(optimized_names), 75)
         self.assertEqual(optimized_names.count("serve.linear"), 15)
         self.assertEqual(optimized_names.count("serve.rope"), 2)
         self.assertEqual(
             optimized_names.count("serve.prefill_attention"),
             2,
         )
+
+    def test_dynamic_export_rejects_batch_one_capture_example(self) -> None:
+        example = make_qwen2_prefill_inputs(
+            self.model.config,
+            batch=1,
+            tokens=2,
+        )
+
+        with self.assertRaisesRegex(ValueError, "导出样例Batch必须至少为2"):
+            export_qwen2_causal_lm_prefill(
+                self.model,
+                example,
+                max_batch=8,
+                max_prompt_length=16,
+            )
 
     def test_optimized_prefill_matches_multiple_dynamic_prompts(self) -> None:
         module = import_exported_program(
@@ -195,9 +210,9 @@ class Qwen2PrefillTest(unittest.TestCase):
             options=CompileOptions(function_name="prefill"),
         )
 
-        self.assertEqual(artifact.coverage.total_operations, 80)
+        self.assertEqual(artifact.coverage.total_operations, 75)
         self.assertEqual(artifact.coverage.lowered_operations, 24)
-        self.assertEqual(artifact.coverage.unlowered_operations, 56)
+        self.assertEqual(artifact.coverage.unlowered_operations, 51)
         self.assertEqual(
             artifact.coverage.lowered_by_name,
             {
@@ -260,9 +275,9 @@ class Qwen2PrefillTest(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(artifact.coverage.total_operations, 83)
+        self.assertEqual(artifact.coverage.total_operations, 78)
         self.assertEqual(artifact.coverage.lowered_operations, 27)
-        self.assertEqual(artifact.coverage.unlowered_operations, 56)
+        self.assertEqual(artifact.coverage.unlowered_operations, 51)
         self.assertEqual(
             artifact.coverage.lowered_by_name[
                 "kernel.triton.kv_prefill_store"

@@ -103,7 +103,11 @@ def _rope_kernel(
     )
     cosine_values = tl.load(cosine + cosine_offsets, mask=valid)
     sine_values = tl.load(sine + sine_offsets, mask=valid)
-    result = values * cosine_values + rotated * sine_values
+    # PyTorch BF16逐元素算子会先分别舍入两个Mul，再执行Add。若只在
+    # 最终Store时舍入，24层模型中的细小差异会被后续残差连接放大。
+    direct = (values * cosine_values).to(query_values.dtype)
+    rotated_part = (rotated * sine_values).to(query_values.dtype)
+    result = direct + rotated_part
 
     query_output_offsets = (
         batch * query_output_stride_batch
@@ -264,7 +268,9 @@ def _rope_flat_kernel(
     )
     cosine_values = tl.load(cosine + cosine_offsets, mask=valid)
     sine_values = tl.load(sine + sine_offsets, mask=valid)
-    result = values * cosine_values + rotated * sine_values
+    direct = (values * cosine_values).to(query_values.dtype)
+    rotated_part = (rotated * sine_values).to(query_values.dtype)
+    result = direct + rotated_part
 
     query_output_offsets = (
         query_batch * query_output_stride_batch

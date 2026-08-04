@@ -17,7 +17,6 @@ from .pass_manager import CompilerPass, PassResult
 # 后续可以在不改变前端和高层优化 Pass 的前提下，为这些操作增加 Launch 配置、
 # Workspace 和内存布局等更底层的信息。
 _KERNEL_LOWERINGS = {
-    "serve.linear": "kernel.triton.linear",
     "serve.prefill_attention": "kernel.triton.prefill_attention",
     "serve.rms_norm": "kernel.triton.rms_norm",
     "serve.rope": "kernel.triton.rope",
@@ -34,7 +33,9 @@ _RUNTIME_LOWERINGS = {
 
 _EXECUTABLE_OPERATIONS = frozenset(
     _KERNEL_LOWERINGS.values()
-) | frozenset(_RUNTIME_LOWERINGS.values())
+) | frozenset(_RUNTIME_LOWERINGS.values()) | frozenset(
+    {"kernel.triton.linear", "kernel.cublas.linear"}
+)
 
 
 @dataclass(frozen=True)
@@ -82,7 +83,11 @@ class LowerToKernelIRPass(CompilerPass):
         for function in module.functions:
             for operation in function.block.operations:
                 source_name = operation.name
-                target_name = _KERNEL_LOWERINGS.get(source_name)
+                target_name = (
+                    _select_linear_backend(operation)
+                    if source_name == "serve.linear"
+                    else _KERNEL_LOWERINGS.get(source_name)
+                )
                 if target_name is None:
                     target_name = _RUNTIME_LOWERINGS.get(source_name)
                 if target_name is None:
@@ -103,6 +108,22 @@ class LowerToKernelIRPass(CompilerPass):
                 "coverage": coverage.to_dict(),
             },
         )
+
+
+def _select_linear_backend(operation) -> str:
+    """大静态GEMM交给cuBLAS，小M研究路径继续使用Triton。"""
+
+    input_features = operation.attributes.get("input_features")
+    output_features = operation.attributes.get("output_features")
+    if (
+        isinstance(input_features, int)
+        and isinstance(output_features, int)
+        and max(input_features, output_features) >= 4096
+    ):
+        operation.attributes["backend_selection"] = "large_static_gemm"
+        return "kernel.cublas.linear"
+    operation.attributes["backend_selection"] = "small_static_gemm"
+    return "kernel.triton.linear"
 
 
 def analyze_lowering_coverage(module: Module) -> LoweringCoverage:

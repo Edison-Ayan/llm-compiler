@@ -28,6 +28,7 @@ def _rms_norm_kernel(
     hidden_size: tl.constexpr,
     epsilon: tl.constexpr,
     block_size: tl.constexpr,
+    round_before_weight: tl.constexpr,
 ):
     """一个 Triton Program 处理一行 Hidden State。
 
@@ -120,11 +121,12 @@ def _rms_norm_kernel(
     #
     # 加载后统一转换为 FP32，
     # 避免在 FP16/BF16 下进行长向量归约时产生较大误差。
-    values = tl.load(
+    input_values = tl.load(
         input_row + offsets,
         mask=mask,
         other=0.0,
-    ).to(tl.float32)
+    )
+    values = input_values.to(tl.float32)
 
     # 计算一行元素的平方和：
     #
@@ -161,11 +163,12 @@ def _rms_norm_kernel(
     # 每一行输入都使用相同的一组 Weight。
     #
     # Weight 同样转换成 FP32参与计算。
-    weights = tl.load(
+    input_weights = tl.load(
         weight_pointer + offsets,
         mask=mask,
         other=0.0,
-    ).to(tl.float32)
+    )
+    weights = input_weights.to(tl.float32)
 
     # 执行 RMSNorm：
     #
@@ -174,7 +177,14 @@ def _rms_norm_kernel(
     #
     # inverse_rms 是一个标量，
     # 会广播到当前行的所有元素。
-    normalized = values * inverse_rms * weights
+    normalized = values * inverse_rms
+    if round_before_weight:
+        # 官方Qwen2先把归一化结果舍入回输入DType，再执行Weight乘法。
+        # 对深层BF16模型，这次中间舍入属于可观察的数值语义。
+        normalized = normalized.to(input_values.dtype)
+        normalized = normalized * input_weights
+    else:
+        normalized = normalized * weights
 
     # 计算当前输出行的起始地址。
     output_row = output_pointer + row * row_stride
@@ -199,6 +209,7 @@ def triton_rms_norm(
     epsilon: float,
     output_dtype: str | torch.dtype | None = None,
     num_warps: int | None = None,
+    round_before_weight: bool = False,
 ) -> torch.Tensor:
     """执行输入最后一维上的 RMSNorm。
 
@@ -422,6 +433,7 @@ def triton_rms_norm(
         hidden_size=hidden_size,
         epsilon=epsilon,
         block_size=block_size,
+        round_before_weight=round_before_weight,
 
         # num_warps 是 Triton Kernel 启动配置，
         # 表示每个 Program 使用多少个 Warp。

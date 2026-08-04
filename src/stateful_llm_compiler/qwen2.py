@@ -100,15 +100,38 @@ class Qwen2RotaryEmbedding(nn.Module):
 
     def __init__(self, config: Qwen2CompatConfig) -> None:
         super().__init__()
-        dimensions = torch.arange(0, config.head_dim, 2, dtype=torch.float32)
-        inverse_frequency = 1.0 / (
-            config.rope_theta ** (dimensions / config.head_dim)
-        )
+        self._head_dim = config.head_dim
+        self._rope_theta = config.rope_theta
+        inverse_frequency = self._make_inverse_frequency(device=None)
         self.register_buffer(
             "inv_freq",
             inverse_frequency,
             persistent=False,
         )
+
+    def _make_inverse_frequency(
+        self,
+        device: torch.device | None,
+    ) -> Tensor:
+        """始终以FP32重建频率，避免权重DType转换损失RoPE精度。"""
+
+        dimensions = torch.arange(
+            0,
+            self._head_dim,
+            2,
+            dtype=torch.float32,
+            device=device,
+        )
+        return 1.0 / (
+            self._rope_theta ** (dimensions / self._head_dim)
+        )
+
+    def _apply(self, fn, recurse: bool = True):
+        """迁移Device后重建FP32 Buffer，不跟随模型权重转成BF16。"""
+
+        result = super()._apply(fn, recurse=recurse)
+        self.inv_freq = self._make_inverse_frequency(self.inv_freq.device)
+        return result
 
     def forward(
         self,

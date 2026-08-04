@@ -1,4 +1,4 @@
-# Linear 从 ATen 到 Triton 的完整 Lowering
+# Linear 从 ATen 到 Triton/cuBLAS 的 Lowering
 
 ## 编译路径
 
@@ -9,14 +9,13 @@ aten.linear.default
     ↓ NormalizeLinearPass
 serve.linear
     ↓ LowerToKernelIRPass
-kernel.triton.linear
+kernel.triton.linear / kernel.cublas.linear
     ↓ TritonExecutor
-Triton tiled GEMM
+Triton tiled GEMM / CUDA库GEMM
 ```
 
-`serve.linear` 保留模型级语义和类型契约；`kernel.triton.linear` 表示后端已经确定，
-strict 模式不再允许调用 `torch.nn.functional.linear`、`torch.matmul` 或
-`torch.compile` 承接计算。
+`serve.linear`保留模型级语义和类型契约；两个`kernel.*.linear`都表示后端已经
+显式确定。strict模式不会允许仍停留在`aten.linear`的节点执行。
 
 ## IR 契约
 
@@ -69,7 +68,24 @@ Weight保持 PyTorch 的物理 `N×K` 布局。地址计算直接把它作为 `K
 FP32路径为 `tl.dot` 指定 IEEE 输入精度，避免默认 TF32 舍入影响 Qwen2 高精度差分。
 当前调度使用简单的 16/32/64 Tile规则，尚未实现 Autotune和硬件 Profile。
 
-## Qwen2 覆盖率变化
+## 大矩阵的cuBLAS后端选择
+
+真实Qwen2-0.5B的`down_proj`包含`4864→896`大归约GEMM。初版Triton Kernel在BF16
+下对这类形状与官方CUDA库路径出现明显累积差异，因此Lowering当前采用明确规则：
+
+```text
+max(input_features, output_features) >= 4096
+    -> kernel.cublas.linear
+其他静态Linear
+    -> kernel.triton.linear
+```
+
+Qwen2-0.5B中73个Linear选择cuBLAS路径，包括每层Gate/Up/Down Projection及LM Head；
+96个Q/K/V/O Projection继续使用Triton。当前`kernel.cublas.linear`由执行器通过
+`torch.nn.functional.linear`进入CUDA库实现，所以它是一个可审计的库调用Lowering
+原型，还不是直接调用cuBLAS C API的独立Runtime。这个边界会在后续Runtime层完善。
+
+## Qwen2 覆盖率变化（Linear里程碑当时）
 
 两层 Qwen2 Decode 优化后仍为111个操作：
 
