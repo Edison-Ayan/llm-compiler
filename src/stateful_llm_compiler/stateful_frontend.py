@@ -8,12 +8,12 @@ from pathlib import Path
 
 import torch
 
-from .frontend import export_stateful_decode
+from .frontend import export_multilayer_stateful_decode
 from .graph_summary import summarize_exported_program
 from .model import (
     DecoderConfig,
-    StatefulTinyDecoderBlock,
-    make_decode_inputs,
+    StatefulTinyDecoder,
+    make_multilayer_decode_inputs,
 )
 
 
@@ -30,27 +30,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-cache-length", type=int, default=128)
     parser.add_argument("--verify-batch", type=int, default=3)
     parser.add_argument("--verify-past-length", type=int, default=13)
+    parser.add_argument("--num-layers", type=int, default=2)
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
     torch.manual_seed(0)
-    config = DecoderConfig()
-    model = StatefulTinyDecoderBlock(config).eval()
-    example_inputs = make_decode_inputs(
+    config = DecoderConfig(num_layers=args.num_layers)
+    model = StatefulTinyDecoder(config).eval()
+    example_inputs = make_multilayer_decode_inputs(
         config,
         args.example_batch,
         args.example_past_length,
     )
-    program = export_stateful_decode(
+    program = export_multilayer_stateful_decode(
         model,
         example_inputs,
         max_batch=args.max_batch,
         max_cache_length=args.max_cache_length,
     )
 
-    verify_inputs = make_decode_inputs(
+    verify_inputs = make_multilayer_decode_inputs(
         config,
         args.verify_batch,
         args.verify_past_length,
@@ -59,15 +60,18 @@ def main() -> None:
     with torch.no_grad():
         expected = model(*verify_inputs)
         actual = program.module()(*verify_inputs)
-    errors = [
-        float((left - right).abs().max())
-        for left, right in zip(expected, actual)
-    ]
+    errors = [float((expected[0] - actual[0]).abs().max())]
+    for expected_slot, actual_slot in zip(expected[1], actual[1]):
+        errors.extend(
+            float((left - right).abs().max())
+            for left, right in zip(expected_slot, actual_slot)
+        )
 
     summary = summarize_exported_program(program)
     summary["frontend"] = {
-        "model": "StatefulTinyDecoderBlock",
+        "model": "StatefulTinyDecoder",
         "mode": "single_token_decode",
+        "num_layers": config.num_layers,
         "example_batch": args.example_batch,
         "example_past_length": args.example_past_length,
         "verification_batch": args.verify_batch,

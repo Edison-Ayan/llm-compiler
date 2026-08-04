@@ -19,6 +19,7 @@ class DecoderConfig:
     num_heads: int = 4
     num_kv_heads: int = 2
     intermediate_size: int = 128
+    num_layers: int = 2
     rms_norm_eps: float = 1e-6
 
     def __post_init__(self) -> None:
@@ -26,6 +27,8 @@ class DecoderConfig:
             raise ValueError("hidden_size 必须能被 num_heads 整除")
         if self.num_heads % self.num_kv_heads:
             raise ValueError("num_heads 必须能被 num_kv_heads 整除")
+        if self.num_layers <= 0:
+            raise ValueError("num_layers 必须为正数")
 
     @property
     def head_dim(self) -> int:
@@ -196,6 +199,52 @@ class StatefulTinyDecoderBlock(TinyDecoderBlock):
         return output, key_cache, value_cache
 
 
+class StatefulTinyDecoder(nn.Module):
+    """由多个 Qwen/Llama 风格 Decoder Layer 组成的 Stateful 模型。
+
+    Cache 使用 Hugging Face 常见的 ``((key_0, value_0), ...)`` 嵌套结构。
+    这一结构会被 ``torch.export`` 展平为独立输入，随后由 ServeIR Pass 合并成
+    一个带多个 Layer Slot 的显式 KV 状态。
+    """
+
+    def __init__(self, config: DecoderConfig | None = None) -> None:
+        super().__init__()
+        self.config = config or DecoderConfig()
+        self.layers = nn.ModuleList(
+            StatefulTinyDecoderBlock(self.config)
+            for _ in range(self.config.num_layers)
+        )
+        self.final_norm = RMSNorm(
+            self.config.hidden_size,
+            self.config.rms_norm_eps,
+        )
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        past_key_values: tuple[tuple[Tensor, Tensor], ...],
+    ) -> tuple[Tensor, tuple[tuple[Tensor, Tensor], ...]]:
+        if len(past_key_values) != len(self.layers):
+            raise ValueError("KV Cache Slot 数量必须等于 Decoder Layer 数量")
+
+        present_key_values = []
+        for layer, (past_key, past_value) in zip(
+            self.layers,
+            past_key_values,
+        ):
+            hidden_states, present_key, present_value = layer(
+                hidden_states,
+                attention_mask,
+                past_key,
+                past_value,
+            )
+            present_key_values.append((present_key, present_value))
+
+        hidden_states = self.final_norm(hidden_states)
+        return hidden_states, tuple(present_key_values)
+
+
 def make_inputs(
     config: DecoderConfig,
     batch: int,
@@ -267,3 +316,57 @@ def make_decode_inputs(
         dtype=dtype,
     )
     return hidden_states, attention_mask, past_key, past_value
+
+
+def make_multilayer_decode_inputs(
+    config: DecoderConfig,
+    batch: int,
+    past_length: int,
+    *,
+    seed: int = 0,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[
+    Tensor,
+    Tensor,
+    tuple[tuple[Tensor, Tensor], ...],
+]:
+    """创建共享 Batch 和历史长度的多层 Stateful Decode 输入。"""
+
+    if past_length < 1:
+        raise ValueError("Decode 的 past_length 必须至少为 1")
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    hidden_states = torch.randn(
+        batch,
+        1,
+        config.hidden_size,
+        generator=generator,
+        dtype=dtype,
+    )
+    past_key_values = []
+    for _ in range(config.num_layers):
+        past_key = torch.randn(
+            batch,
+            config.num_kv_heads,
+            past_length,
+            config.head_dim,
+            generator=generator,
+            dtype=dtype,
+        )
+        past_value = torch.randn(
+            batch,
+            config.num_kv_heads,
+            past_length,
+            config.head_dim,
+            generator=generator,
+            dtype=dtype,
+        )
+        past_key_values.append((past_key, past_value))
+    # 所有 Layer 在同一轮 Decode 中共享逻辑 Token 长度和加法 Mask。
+    attention_mask = torch.zeros(
+        batch,
+        1,
+        1,
+        past_length + 1,
+        dtype=dtype,
+    )
+    return hidden_states, attention_mask, tuple(past_key_values)

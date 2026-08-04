@@ -309,7 +309,8 @@ PYTHONPATH=src python benchmarks/bench_kv_store.py \
 
 ## 当前边界
 
-- 当前只自动 Bufferize 一个 Decoder Layer/Slot；
+- 已能事务式 Bufferize 多个连续 Decoder Layer Slot；任一 Append 不满足契约时，
+  整个函数都不会留下部分 Lower 的混合状态；
 - 非 Bufferized Stateful 路径仍保留 `serve.kv.read` 作为清晰的参考语义；
 - Bufferized Decode 已由 `serve.decode_attention` 直接消费 Buffer、Lengths 和 Slot；
 - Store 已支持每 Batch 不同 Position，但当前前端 Mask Fixture 仍使用统一 Past Length；

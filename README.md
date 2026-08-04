@@ -2,7 +2,7 @@
 
 面向动态、有状态 LLM Serving 工作负载的研究型编译器。
 
-当前已经完成九个里程碑：
+当前已经完成十七个里程碑：
 
 1. 使用 `torch.export` 捕获带动态 Batch/序列长度的 Qwen 风格 Decoder；
 2. 将 Functional ATen 图导入自研 ServeIR，显式建模 SSA、动态类型和 KV 副作用；
@@ -14,7 +14,23 @@
    CPU/GPU 多轮差分验证；
 8. 自动把逻辑 KV Append Bufferize 为预分配位置写入，并 Lower 到 Triton KV Store；
 9. 把 GQA Decode Attention 融合为 `serve.decode_attention`，通过 Online Softmax
-   Triton Kernel 直接消费物理 KV Buffer 和设备 Length。
+   Triton Kernel 直接消费物理 KV Buffer 和设备 Length；
+10. 导出 Hugging Face 风格的嵌套多层 KV Cache，自动合并为一个多 Slot 状态，并
+    完成两层 Decoder 的 Bufferization、Attention 融合和 CPU/GPU 端到端差分；
+11. 对齐 Hugging Face Qwen2 的独立 Q/K/V、默认 RoPE、SwiGLU 和多层 Cache，完成
+    官方随机权重逐层零误差对照及 ServeIR/Triton GPU 差分；
+12. 建立 ServeIR→KernelIR 后端边界、统一编译入口、Lowering 覆盖报告和严格零
+    PyTorch 回退模式，开始从“部分 Triton 加速”进入“整图编译”阶段；
+13. 把 Qwen2 的全部 Linear 规范化为 `serve.linear`，Lower 到支持动态 M 和可选
+    Bias 的 Triton tiled GEMM，使两层 Decode 后端覆盖率从11.71%提升到24.32%；
+14. 增加完整Qwen2ForCausalLM边界，捕获动态Input IDs、Embedding、Prefill、LM Head、
+    Logits和KV整图，并验证Prefill Cache可零误差衔接下一次Decode；
+15. 将多Token GQA Attention融合为`serve.prefill_attention`并Lower到Triton Online
+    Softmax Kernel，Prefill图从128降至110个操作，实测相比展开GQA几何平均加速3.281×；
+16. 将Prefill多层Tensor Cache物化为预分配状态并用Triton批量写入，完整CausalLM
+    Decode可在相同Buffer地址上从Length=T继续追加，实现阶段间零历史Cache复制。
+17. 将每层16个Qwen2 RoPE展开节点融合为双结果`serve.rope`并Lower到单Launch Triton
+    Kernel，按Decode/Prefill选择调度变体，相比TorchInductor几何平均加速1.247×。
 
 项目仍保持 CPU 可运行；GPU Profile、Triton Kernel 和运行时分派是可选能力。
 
@@ -48,6 +64,19 @@ PYTHONPATH=src python -m stateful_llm_compiler.optimizer \
   --stats-out artifacts/optimization_stats.json
 ```
 
+继续 Lower 到 KernelIR 并输出后端覆盖报告：
+
+```bash
+PYTHONPATH=src python -m stateful_llm_compiler.optimizer \
+  artifacts/decoder.pt2 \
+  --lower-kernel-ir \
+  --out artifacts/decoder.kernelir \
+  --stats-out artifacts/decoder_compile_stats.json
+```
+
+`--require-full-lowering` 会启用零回退检查。当前完整 Decoder 图仍会报告未实现的
+ATen Lowering，这是后续补齐Embedding、SwiGLU、RoPE系数生成和元数据操作的验收标准。
+
 使用 GPU Profile 运行 Profile-Guided Lowering：
 
 ```bash
@@ -65,6 +94,7 @@ PYTHONPATH=src python -m stateful_llm_compiler.stateful_frontend \
   --out artifacts/stateful_decode.json \
   --graph-out artifacts/stateful_decode.txt \
   --program-out artifacts/stateful_decode.pt2 \
+  --num-layers 2 \
   --example-past-length 4 \
   --max-cache-length 64
 ```
@@ -137,6 +167,40 @@ PYTHONPATH=src python benchmarks/bench_decode_attention.py \
   --out artifacts/decode_attention_benchmark.json
 ```
 
+运行 Linear GPU 基准：
+
+```bash
+PYTHONPATH=src python benchmarks/bench_linear.py \
+  --rows 1,8,32 \
+  --shapes 512x512,1536x1536 \
+  --bias \
+  --out artifacts/linear_benchmark_v1.json
+```
+
+运行 Prefill Attention GPU基准：
+
+```bash
+PYTHONPATH=src python benchmarks/bench_prefill_attention.py \
+  --batches 1,2 \
+  --tokens 16,64,128 \
+  --query-heads 4 \
+  --kv-heads 2 \
+  --head-dim 64 \
+    --out artifacts/prefill_attention_benchmark_v1.json
+```
+
+运行RoPE与TorchInductor对比基准：
+
+```bash
+PYTHONPATH=src python benchmarks/bench_rope.py \
+  --batches 1,8 \
+  --tokens 1,128,512 \
+  --query-heads 14 \
+  --kv-heads 2 \
+  --head-dim 64 \
+  --out artifacts/rope_benchmark.json
+```
+
 运行测试：
 
 ```bash
@@ -168,6 +232,15 @@ attention_mask: [batch, 1, sequence, sequence]
 - `docs/kv-bufferization.md`：KV Bufferization、物理 Layout、Triton Store 和性能结果。
 - `docs/decode-attention.md`：Attention IR 融合、Online Softmax Triton Lowering 和
   GPU 性能结果。
+- `docs/qwen2-compatibility.md`：官方 Qwen2 权重映射、RoPE、多层逐项差分和编译结果。
+- `docs/compiler-pipeline.md`：对标 `torch.compile` 的整图编译目标、KernelIR 和严格
+  零回退契约。
+- `docs/linear-lowering.md`：Linear IR契约、Triton tiled GEMM、Qwen2覆盖率和性能结果。
+- `docs/qwen2-prefill.md`：完整CausalLM边界、动态Prefill、KV输出和Decode衔接验证。
+- `docs/prefill-attention.md`：多Token GQA融合、Triton Online Softmax和性能实验。
+- `docs/prefill-kv-state.md`：Prefill状态化、批量KV Store和Decode共享物理ABI。
+- `docs/rope-lowering.md`：Qwen2 RoPE子图融合、双结果IR、动态Triton调度和
+  TorchInductor性能对比。
 
 ## 当前边界
 
@@ -176,8 +249,20 @@ attention_mask: [batch, 1, sequence, sequence]
 导出期断言并融合两个 RMSNorm，将 IR 降至 44 个 Operation。参考执行器已在 FP32/FP16
 和多组动态 Shape 下验证优化前后误差为 0。`serve.rms_norm` 已支持 Triton、Inductor
 和 PyTorch Native 多后端选择；本机 Profile 证明最优后端会随 Shape 改变。单 Token
-Decode 已支持动态历史长度，并将 Tensor Cache 改写为带读写副作用的显式 KV 状态。
+Decode 已支持动态历史长度，并将多层嵌套 Tensor Cache 改写为带读写副作用的单一
+多 Slot KV 状态；当前两层路径已完成 CPU/GPU 多轮差分。
 KV Append 已能自动 Bufferize 为预分配位置写入；RTX 4060 上 Triton Store 相比
 `torch.cat` 九组配置几何平均加速 7.064×。Decode Attention 已直接消费物理 KV
 Buffer，六组配置相比原展开路径几何平均加速 1.545×；当前仍只支持单 Token、连续
-Layout，Paged KV Cache、Block Table 和长上下文 Split-Sequence 属于后续阶段。
+Layout。两层 Qwen2 兼容路径已无外部算子地导入 ServeIR 并完成 GPU 数值差分，但当前
+执行器仍会让未 Lower 的 ATen 节点走 PyTorch 参考实现，不能称为完整后端编译。新增的
+KernelIR 覆盖报告和 strict 模式已经把这部分缺口显式化。Qwen2中的14个Decode
+Linear和两层RoPE已全部 Lower 到 Triton，两层Decoder Decode的当前后端覆盖率为
+29/81（35.80%）。完整
+Qwen2ForCausalLM Prefill已经从Input IDs导出到Logits和多层KV Cache；15个Linear和
+两个Prefill Attention及两层RoPE均进入Triton。状态化Prefill会创建同Decode一致的
+预分配KV Buffer并批量写入，Decode随后在原地址继续追加；状态化Prefill覆盖率为
+27/83（32.53%）。RoPE Kernel在RTX 4060六组配置中相比PyTorch Eager几何平均加速
+4.830×、相比TorchInductor加速1.247×。Embedding、SwiGLU和Cosine/Sine生成仍未完成
+后端化。
+Paged KV Cache、Block Table和长上下文Split-Sequence属于后续阶段。

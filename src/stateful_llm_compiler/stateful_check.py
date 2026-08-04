@@ -71,40 +71,52 @@ def run_stateful_differential(
     state_type = state_argument.type
     dtype = _torch_dtype(state_type.dtype)
     generator = torch.Generator(device="cpu").manual_seed(seed)
-    key = torch.randn(
-        batch,
-        state_type.num_kv_heads,
-        past_length,
-        state_type.head_dim,
-        generator=generator,
-        dtype=dtype,
-    )
-    value = torch.randn(
-        batch,
-        state_type.num_kv_heads,
-        past_length,
-        state_type.head_dim,
-        generator=generator,
-        dtype=dtype,
+    past_key_values = tuple(
+        (
+            torch.randn(
+                batch,
+                state_type.num_kv_heads,
+                past_length,
+                state_type.head_dim,
+                generator=generator,
+                dtype=dtype,
+            ),
+            torch.randn(
+                batch,
+                state_type.num_kv_heads,
+                past_length,
+                state_type.head_dim,
+                generator=generator,
+                dtype=dtype,
+            ),
+        )
+        for _ in range(state_type.num_layers)
     )
     if preallocate_kv:
         capacity = state_type.capacity
         if capacity is None:
             raise TypeError("Bufferized KVState 缺少 Capacity")
-        state = PreallocatedKVCacheState.from_tensors(
-            key,
-            value,
+        state = PreallocatedKVCacheState.from_layer_tensors(
+            past_key_values,
             capacity=capacity,
         )
     else:
-        state = KVCacheState.from_tensors(key, value)
+        state = KVCacheState.from_layer_tensors(past_key_values)
     executor = ReferenceExecutor()
     rows = []
+    user_names = {
+        spec.arg.name
+        for spec in program.graph_signature.input_specs
+        if spec.kind.name == "USER_INPUT"
+    }
 
     with torch.no_grad():
         for step in range(steps):
-            logical_key, logical_value = state.read(0)
-            cache_before = logical_key.shape[2]
+            logical_cache = tuple(
+                state.read(slot)
+                for slot in range(state_type.num_layers)
+            )
+            cache_before = logical_cache[0][0].shape[2]
             hidden = torch.randn(
                 batch,
                 1,
@@ -119,11 +131,19 @@ def run_stateful_differential(
                 cache_before + 1,
                 dtype=dtype,
             )
-            expected = program.module()(
+            extra_user_inputs = {}
+            if "position_ids" in user_names:
+                extra_user_inputs["position_ids"] = torch.full(
+                    (batch, 1),
+                    cache_before,
+                    dtype=torch.int64,
+                )
+            expected_output, expected_cache = _run_exported_decode(
+                program,
                 hidden,
                 mask,
-                logical_key,
-                logical_value,
+                logical_cache,
+                extra_user_inputs,
             )
             result = executor.run(
                 module,
@@ -132,29 +152,72 @@ def run_stateful_differential(
                     hidden,
                     mask,
                     state,
+                    extra_user_inputs=extra_user_inputs,
                 ),
             )
             output, state = result.outputs
-            actual_key, actual_value = state.read(0)
+            actual_cache = tuple(
+                state.read(slot)
+                for slot in range(state_type.num_layers)
+            )
+            key_error = max(
+                _max_abs(actual[0], expected[0])
+                for actual, expected in zip(actual_cache, expected_cache)
+            )
+            value_error = max(
+                _max_abs(actual[1], expected[1])
+                for actual, expected in zip(actual_cache, expected_cache)
+            )
             rows.append(
                 StatefulDifferentialRow(
                     step=step,
                     cache_length_before=cache_before,
-                    cache_length_after=actual_key.shape[2],
+                    cache_length_after=actual_cache[0][0].shape[2],
                     state_generation=state.generation,
-                    output_max_abs_error=_max_abs(output, expected[0]),
-                    key_max_abs_error=_max_abs(
-                        actual_key,
-                        expected[1],
-                    ),
-                    value_max_abs_error=_max_abs(
-                        actual_value,
-                        expected[2],
-                    ),
+                    output_max_abs_error=_max_abs(output, expected_output),
+                    key_max_abs_error=key_error,
+                    value_max_abs_error=value_error,
                     operations=len(result.executed_operations),
                 )
             )
     return rows
+
+
+def _run_exported_decode(
+    program: torch.export.ExportedProgram,
+    hidden: torch.Tensor,
+    mask: torch.Tensor,
+    logical_cache: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    extra_user_inputs: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, tuple[tuple[torch.Tensor, torch.Tensor], ...]]:
+    """统一旧单层签名和 Hugging Face 风格多层嵌套 Cache 的输出。"""
+
+    user_names = {
+        spec.arg.name
+        for spec in program.graph_signature.input_specs
+        if spec.kind.name == "USER_INPUT"
+    }
+    if "past_key" in user_names:
+        output, key, value = program.module()(
+            hidden,
+            mask,
+            *logical_cache[0],
+        )
+        return output, ((key, value),)
+    if "position_ids" in user_names:
+        output, present_key_values = program.module()(
+            hidden,
+            mask,
+            extra_user_inputs["position_ids"],
+            logical_cache,
+        )
+    else:
+        output, present_key_values = program.module()(
+            hidden,
+            mask,
+            logical_cache,
+        )
+    return output, present_key_values
 
 
 def _max_abs(left: torch.Tensor, right: torch.Tensor) -> float:

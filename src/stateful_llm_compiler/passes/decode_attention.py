@@ -128,16 +128,12 @@ def _match_attention(
     ):
         return None
 
-    division = _single_user(
-        score_matmul.results[0],
-        analysis,
-        "aten.div.Tensor",
-    )
-    divisor = _literal_argument(division, 1) if division is not None else None
-    if not isinstance(divisor, (int, float)) or float(divisor) <= 0:
+    scaling = _match_score_scaling(score_matmul.results[0], analysis)
+    if scaling is None:
         return None
+    scaling_operation, scale = scaling
 
-    score_value = division.results[0]
+    score_value = scaling_operation.results[0]
     score_cast = _optional_single_user(
         score_value,
         analysis,
@@ -201,7 +197,7 @@ def _match_attention(
         value_repeat,
         key_transpose,
         score_matmul,
-        division,
+        scaling_operation,
     ]
     if score_cast is not None:
         operations.append(score_cast)
@@ -227,7 +223,7 @@ def _match_attention(
         mask,
         slot,
         groups,
-        1.0 / float(divisor),
+        scale,
     )
 
 
@@ -301,6 +297,46 @@ def _literal_argument(
     ):
         return None
     return arguments["tuple"][index]
+
+
+def _match_score_scaling(
+    score: Value,
+    analysis: UseDefAnalysis,
+) -> tuple[Operation, float] | None:
+    """匹配旧图的除法缩放和 Qwen2 使用的乘法缩放。"""
+
+    uses = analysis.uses(score)
+    if len(uses) != 1 or uses[0].operation is None:
+        return None
+    operation = uses[0].operation
+    arguments = operation.attributes.get("args")
+    if not isinstance(arguments, dict) or set(arguments) != {"tuple"}:
+        return None
+    positional = arguments["tuple"]
+    score_argument = {"ssa": score.name}
+    if (
+        operation.name == "aten.div.Tensor"
+        and isinstance(positional, list)
+        and len(positional) == 2
+        and positional[0] == score_argument
+        and isinstance(positional[1], (int, float))
+        and float(positional[1]) > 0
+    ):
+        return operation, 1.0 / float(positional[1])
+    if (
+        operation.name == "aten.mul.Tensor"
+        and isinstance(positional, list)
+        and len(positional) == 2
+    ):
+        if positional[0] == score_argument:
+            multiplier = positional[1]
+        elif positional[1] == score_argument:
+            multiplier = positional[0]
+        else:
+            return None
+        if isinstance(multiplier, (int, float)) and float(multiplier) > 0:
+            return operation, float(multiplier)
+    return None
 
 
 def _ssa_arguments_match(

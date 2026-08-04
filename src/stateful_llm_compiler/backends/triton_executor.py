@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -10,12 +10,18 @@ import torch.nn.functional as F
 from ..cost_model import resolve_lowering_plan
 from ..execution import (
     ExecutionError,
+    ExecutionResult,
     PreallocatedKVCacheState,
     ReferenceExecutor,
 )
+from ..ir import Module
+from ..lowering import require_full_lowering
 from .triton_attention import triton_decode_attention
 from .triton_kv import triton_kv_store
+from .triton_linear import triton_linear
+from .triton_prefill_attention import triton_prefill_attention
 from .triton_rmsnorm import triton_rms_norm
+from .triton_rope import triton_rope
 
 
 def _inductor_rms_norm(
@@ -31,14 +37,174 @@ def _inductor_rms_norm(
 
 
 class TritonExecutor(ReferenceExecutor):
-    """未注册 Triton Lowering 的 ATen 操作继续使用 PyTorch 参考语义。"""
+    """执行 Triton KernelIR；兼容模式仍允许参考执行器承接旧图。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, strict: bool = False) -> None:
         super().__init__()
+        self.strict = strict
         self.lowering_trace: list[dict[str, Any]] = []
         self._inductor_kernels: dict[
             tuple[str, torch.dtype, int, float], Any
         ] = {}
+
+    def run(
+        self,
+        module: Module,
+        arguments: Sequence[Any],
+        *,
+        function_name: str | None = None,
+    ) -> ExecutionResult:
+        if self.strict:
+            # 在执行任何节点之前检查整图，禁止运行到中途才发现 eager 回退。
+            require_full_lowering(module)
+        return super().run(
+            module,
+            arguments,
+            function_name=function_name,
+        )
+
+    def _execute_operation(
+        self,
+        name: str,
+        attributes: dict[str, Any],
+        operands,
+        environment: dict[str, Any],
+    ) -> Any:
+        runtime_operands = [environment[value.name] for value in operands]
+        if name == "kernel.triton.rms_norm":
+            return self._kernel_triton_rms_norm(
+                runtime_operands,
+                attributes,
+            )
+        if name == "kernel.triton.linear":
+            return self._kernel_triton_linear(runtime_operands, attributes)
+        if name == "kernel.triton.prefill_attention":
+            return self._kernel_triton_prefill_attention(
+                runtime_operands,
+                attributes,
+            )
+        if name == "kernel.triton.rope":
+            return self._kernel_triton_rope(runtime_operands, attributes)
+        if name == "kernel.triton.kv_store":
+            return self._serve_kv_store(runtime_operands, attributes)
+        if name == "kernel.triton.kv_prefill_store":
+            return self._kernel_triton_kv_prefill_store(
+                runtime_operands,
+                attributes,
+            )
+        if name == "kernel.triton.decode_attention":
+            return self._serve_decode_attention(runtime_operands, attributes)
+        if name == "runtime.kv.length":
+            return super()._serve_kv_length(runtime_operands, attributes)
+        if name == "runtime.kv.advance":
+            return super()._serve_kv_advance(runtime_operands, attributes)
+        if name == "runtime.kv.init":
+            return super()._serve_kv_init(runtime_operands, attributes)
+        return super()._execute_operation(
+            name,
+            attributes,
+            operands,
+            environment,
+        )
+
+    @staticmethod
+    def _kernel_triton_linear(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> torch.Tensor:
+        if len(operands) not in {2, 3}:
+            raise ExecutionError(
+                "kernel.triton.linear 需要 input、weight 和可选 bias"
+            )
+        tensor, weight = operands[:2]
+        bias = operands[2] if len(operands) == 3 else None
+        if bool(attributes.get("has_bias")) != (bias is not None):
+            raise ExecutionError(
+                "kernel.triton.linear 的 has_bias 与运行时参数不一致"
+            )
+        return triton_linear(tensor, weight, bias)
+
+    @staticmethod
+    def _kernel_triton_prefill_attention(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> torch.Tensor:
+        if len(operands) != 4:
+            raise ExecutionError(
+                "kernel.triton.prefill_attention需要Q、K、V和mask"
+            )
+        return triton_prefill_attention(
+            *operands,
+            scale=float(attributes["scale"]),
+        )
+
+    @staticmethod
+    def _kernel_triton_rope(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if len(operands) != 4:
+            raise ExecutionError(
+                "kernel.triton.rope需要query、key、cosine和sine"
+            )
+        query, key, cosine, sine = operands
+        if query.shape[-1] != int(attributes["head_dim"]):
+            raise ExecutionError("kernel.triton.rope的Head Dim不匹配")
+        return triton_rope(query, key, cosine, sine)
+
+    @staticmethod
+    def _kernel_triton_kv_prefill_store(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> PreallocatedKVCacheState:
+        if len(operands) != 3 or not isinstance(
+            operands[0],
+            PreallocatedKVCacheState,
+        ):
+            raise ExecutionError(
+                "kernel.triton.kv_prefill_store需要state、key和value"
+            )
+        state, key, value = operands
+        return state.prefill_store(
+            int(attributes.get("slot", 0)),
+            key,
+            value,
+            writer=triton_kv_store,
+        )
+
+    def _kernel_triton_rms_norm(
+        self,
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> torch.Tensor:
+        """执行已经明确 Lower 到 Triton 的 RMSNorm。"""
+
+        if len(operands) != 2:
+            raise ExecutionError("kernel.triton.rms_norm 需要 input 和 weight")
+        tensor, weight = operands
+        hidden_size = tensor.shape[-1]
+        rows = tensor.numel() // hidden_size
+        decision = resolve_lowering_plan(
+            attributes.get("lowering_plan"),
+            rows,
+        )
+        self.lowering_trace.append(
+            {
+                "backend": "triton",
+                "source": "kernel_ir",
+                "rows": rows,
+                "profile_rows": decision.profile_rows,
+                "estimated_us": decision.estimated_us,
+                "num_warps": decision.num_warps,
+            }
+        )
+        return triton_rms_norm(
+            tensor,
+            weight,
+            epsilon=float(attributes["epsilon"]),
+            output_dtype=attributes.get("output_dtype"),
+            num_warps=decision.num_warps,
+        )
 
     def _serve_rms_norm(
         self,

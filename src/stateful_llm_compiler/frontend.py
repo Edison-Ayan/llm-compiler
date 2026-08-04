@@ -7,14 +7,39 @@ import json
 from pathlib import Path
 
 import torch
+from torch import nn
 
 from .graph_summary import summarize_exported_program
 from .model import (
     DecoderConfig,
+    StatefulTinyDecoder,
     StatefulTinyDecoderBlock,
     TinyDecoderBlock,
     make_inputs,
 )
+from .qwen2 import StatefulQwen2ForCausalLM, StatefulQwen2Model
+
+
+class _Qwen2CausalLMDecodeWrapper(nn.Module):
+    """把完整CausalLM的Decode方法暴露为可导出的forward。"""
+
+    def __init__(self, model: StatefulQwen2ForCausalLM) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_key_values,
+    ):
+        return self.model.decode(
+            input_ids,
+            attention_mask,
+            position_ids,
+            past_key_values,
+        )
 
 
 def export_decoder(
@@ -68,6 +93,168 @@ def export_stateful_decode(
     }
     return torch.export.export(
         model.eval(),
+        example_inputs,
+        dynamic_shapes=dynamic_shapes,
+        strict=True,
+    )
+
+
+def export_multilayer_stateful_decode(
+    model: StatefulTinyDecoder,
+    example_inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    ],
+    *,
+    max_batch: int = 8,
+    max_cache_length: int = 128,
+) -> torch.export.ExportedProgram:
+    """导出共享动态 Batch、历史长度和多层 KV Cache 的 Decode。"""
+
+    past_key_values = example_inputs[2]
+    if len(past_key_values) != model.config.num_layers:
+        raise ValueError("导出输入的 KV Slot 数量与模型层数不一致")
+    batch = torch.export.Dim("batch", min=1, max=max_batch)
+    past = torch.export.Dim(
+        "past_sequence",
+        min=1,
+        max=max_cache_length,
+    )
+    cache_shapes = tuple(
+        (
+            {0: batch, 2: past},
+            {0: batch, 2: past},
+        )
+        for _ in past_key_values
+    )
+    dynamic_shapes = {
+        "hidden_states": {0: batch},
+        "attention_mask": {0: batch, 3: past + 1},
+        "past_key_values": cache_shapes,
+    }
+    return torch.export.export(
+        model.eval(),
+        example_inputs,
+        dynamic_shapes=dynamic_shapes,
+        strict=True,
+    )
+
+
+def export_qwen2_stateful_decode(
+    model: StatefulQwen2Model,
+    example_inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    ],
+    *,
+    max_batch: int = 8,
+    max_cache_length: int = 128,
+) -> torch.export.ExportedProgram:
+    """导出带 Position ID、RoPE 和多层 Cache 的 Qwen2 单 Token Decode。"""
+
+    past_key_values = example_inputs[3]
+    if len(past_key_values) != model.config.num_layers:
+        raise ValueError("导出输入的 KV Slot 数量与 Qwen2 模型层数不一致")
+    batch = torch.export.Dim("batch", min=1, max=max_batch)
+    past = torch.export.Dim(
+        "past_sequence",
+        min=1,
+        max=max_cache_length,
+    )
+    cache_shapes = tuple(
+        (
+            {0: batch, 2: past},
+            {0: batch, 2: past},
+        )
+        for _ in past_key_values
+    )
+    dynamic_shapes = {
+        "hidden_states": {0: batch},
+        "attention_mask": {0: batch, 3: past + 1},
+        "position_ids": {0: batch},
+        "past_key_values": cache_shapes,
+    }
+    return torch.export.export(
+        model.eval(),
+        example_inputs,
+        dynamic_shapes=dynamic_shapes,
+        strict=True,
+    )
+
+
+def export_qwen2_causal_lm_prefill(
+    model: StatefulQwen2ForCausalLM,
+    example_inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    *,
+    max_batch: int = 8,
+    max_prompt_length: int = 128,
+) -> torch.export.ExportedProgram:
+    """捕获从Input IDs到Logits和多层KV Cache的动态Prefill整图。"""
+
+    batch = torch.export.Dim("batch", min=1, max=max_batch)
+    tokens = torch.export.Dim(
+        "prompt_tokens",
+        min=2,
+        max=max_prompt_length,
+    )
+    dynamic_shapes = {
+        "input_ids": {0: batch, 1: tokens},
+        "attention_mask": {0: batch, 2: tokens, 3: tokens},
+        "position_ids": {0: batch, 1: tokens},
+    }
+    return torch.export.export(
+        model.eval(),
+        example_inputs,
+        dynamic_shapes=dynamic_shapes,
+        strict=True,
+    )
+
+
+def export_qwen2_causal_lm_decode(
+    model: StatefulQwen2ForCausalLM,
+    example_inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    ],
+    *,
+    max_batch: int = 8,
+    max_cache_length: int = 128,
+) -> torch.export.ExportedProgram:
+    """捕获Input IDs、状态化Decoder和LM Head组成的单Token整图。"""
+
+    past_key_values = example_inputs[3]
+    if len(past_key_values) != model.config.num_layers:
+        raise ValueError("Decode输入的KV Slot数量与CausalLM层数不一致")
+    batch = torch.export.Dim("batch", min=1, max=max_batch)
+    past = torch.export.Dim(
+        "past_sequence",
+        min=1,
+        max=max_cache_length,
+    )
+    cache_shapes = tuple(
+        (
+            {0: batch, 2: past},
+            {0: batch, 2: past},
+        )
+        for _ in past_key_values
+    )
+    dynamic_shapes = {
+        "input_ids": {0: batch},
+        "attention_mask": {0: batch, 3: past + 1},
+        "position_ids": {0: batch},
+        "past_key_values": cache_shapes,
+    }
+    return torch.export.export(
+        _Qwen2CausalLMDecodeWrapper(model).eval(),
         example_inputs,
         dynamic_shapes=dynamic_shapes,
         strict=True,

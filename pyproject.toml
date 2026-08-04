@@ -11,6 +11,7 @@ dependencies = ["torch>=2.8"]
 
 [project.optional-dependencies]
 gpu = ["triton>=3.3"]
+hf = ["transformers>=5.9"]
 
 [project.scripts]
 stateful-llm-export = "stateful_llm_compiler.frontend:main"

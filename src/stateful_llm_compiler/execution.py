@@ -56,6 +56,18 @@ class KVCacheState:
     ) -> "KVCacheState":
         return cls((key,), (value,))
 
+    @classmethod
+    def from_layer_tensors(
+        cls,
+        past_key_values: Sequence[tuple[torch.Tensor, torch.Tensor]],
+    ) -> "KVCacheState":
+        """从 Hugging Face 风格的多层 ``(key, value)`` 序列创建状态。"""
+
+        if not past_key_values:
+            raise ExecutionError("多层 KV Cache 至少需要一个 Layer Slot")
+        keys, values = zip(*past_key_values)
+        return cls(tuple(keys), tuple(values))
+
     def read(self, slot: int) -> tuple[torch.Tensor, torch.Tensor]:
         try:
             return self.keys[slot], self.values[slot]
@@ -119,6 +131,37 @@ class PreallocatedKVCacheState:
                 raise ExecutionError("KV Length DType 必须是 i64")
 
     @classmethod
+    def empty_from_key_template(
+        cls,
+        key: torch.Tensor,
+        *,
+        num_layers: int,
+        capacity: int,
+    ) -> "PreallocatedKVCacheState":
+        """根据B×H×T×D Key模板创建所有Layer Slot的空物理Buffer。"""
+
+        if key.ndim != 4 or num_layers <= 0 or capacity <= 0:
+            raise ExecutionError("KV Init收到非法模板、Layer数量或Capacity")
+        batch, heads, _, head_dim = key.shape
+        keys = tuple(
+            torch.zeros(
+                batch,
+                capacity,
+                heads,
+                head_dim,
+                device=key.device,
+                dtype=key.dtype,
+            )
+            for _ in range(num_layers)
+        )
+        values = tuple(torch.zeros_like(buffer) for buffer in keys)
+        lengths = tuple(
+            torch.zeros(batch, device=key.device, dtype=torch.int64)
+            for _ in range(num_layers)
+        )
+        return cls(keys, values, lengths, capacity)
+
+    @classmethod
     def from_tensors(
         cls,
         key: torch.Tensor,
@@ -154,6 +197,64 @@ class PreallocatedKVCacheState:
             (key_buffer,),
             (value_buffer,),
             (lengths,),
+            capacity,
+        )
+
+    @classmethod
+    def from_layer_tensors(
+        cls,
+        past_key_values: Sequence[tuple[torch.Tensor, torch.Tensor]],
+        *,
+        capacity: int,
+    ) -> "PreallocatedKVCacheState":
+        """把多层逻辑 B×H×S×D Cache 复制到共享契约的预分配 Slot。"""
+
+        if not past_key_values:
+            raise ExecutionError("多层 KV Cache 至少需要一个 Layer Slot")
+        keys = []
+        values = []
+        lengths_by_layer = []
+        expected_structure = None
+        for slot, (key, value) in enumerate(past_key_values):
+            if key.shape != value.shape or key.ndim != 4:
+                raise ExecutionError(
+                    f"第 {slot} 层初始 KV 必须是相同 Shape 的 B×H×S×D"
+                )
+            batch, heads, sequence, head_dim = key.shape
+            structure = (batch, heads, sequence, head_dim, key.dtype, key.device)
+            if expected_structure is None:
+                expected_structure = structure
+            elif structure != expected_structure:
+                raise ExecutionError("所有 Layer Slot 的 KV Shape、DType 和设备必须一致")
+            if sequence > capacity:
+                raise ExecutionError(
+                    f"第 {slot} 层初始 KV 长度 {sequence} 超过 Capacity {capacity}"
+                )
+            key_buffer = torch.zeros(
+                batch,
+                capacity,
+                heads,
+                head_dim,
+                device=key.device,
+                dtype=key.dtype,
+            )
+            value_buffer = torch.zeros_like(key_buffer)
+            key_buffer[:, :sequence].copy_(key.transpose(1, 2))
+            value_buffer[:, :sequence].copy_(value.transpose(1, 2))
+            keys.append(key_buffer)
+            values.append(value_buffer)
+            lengths_by_layer.append(
+                torch.full(
+                    (batch,),
+                    sequence,
+                    device=key.device,
+                    dtype=torch.int64,
+                )
+            )
+        return cls(
+            tuple(keys),
+            tuple(values),
+            tuple(lengths_by_layer),
             capacity,
         )
 
@@ -301,6 +402,22 @@ class PreallocatedKVCacheState:
         # Store 只修改当前逻辑长度之外的物理位置，旧状态的可见前缀保持不变。
         return self
 
+    def prefill_store(
+        self,
+        slot: int,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        writer=None,
+    ) -> "PreallocatedKVCacheState":
+        """从位置0批量写入一个Layer的Prompt K/V并推进逻辑长度。"""
+
+        positions = self.positions(slot)
+        if torch.any(positions != 0):
+            raise ExecutionError("Prefill KV Store要求目标Slot的初始长度为0")
+        self.store(slot, key, value, positions, writer=writer)
+        return self.advance(slot, delta=key.shape[2])
+
     def advance(
         self,
         slot: int,
@@ -384,10 +501,21 @@ class ReferenceExecutor:
             "aten.sym_size.int": lambda tensor, dim: tensor.shape[dim],
             "aten.to.dtype": self._to_dtype,
             "aten.linear.default": F.linear,
+            "aten.embedding.default": torch.ops.aten.embedding.default,
             "aten.split_with_sizes.default": torch.split,
             "builtin.getitem": lambda value, index: value[index],
             "aten.view.default": lambda tensor, shape: tensor.view(shape),
             "aten.transpose.int": torch.transpose,
+            "aten.contiguous.default": torch.ops.aten.contiguous.default,
+            "aten.unsqueeze.default": torch.unsqueeze,
+            "aten.slice.Tensor": torch.ops.aten.slice.Tensor,
+            "aten.cat.default": lambda tensors, dim=0: torch.cat(
+                tuple(tensors),
+                dim=dim,
+            ),
+            "aten.neg.default": torch.neg,
+            "aten.cos.default": torch.cos,
+            "aten.sin.default": torch.sin,
             "aten.repeat_interleave.self_int": torch.repeat_interleave,
             "aten.matmul.default": torch.matmul,
             "aten.div.Tensor": torch.div,
@@ -462,8 +590,33 @@ class ReferenceExecutor:
                 [environment[value.name] for value in operands],
                 attributes,
             )
+        if name == "serve.linear":
+            return self._serve_linear(
+                [environment[value.name] for value in operands],
+                attributes,
+            )
+        if name == "serve.prefill_attention":
+            return self._serve_prefill_attention(
+                [environment[value.name] for value in operands],
+                attributes,
+            )
+        if name == "serve.rope":
+            return self._serve_rope(
+                [environment[value.name] for value in operands],
+                attributes,
+            )
         if name == "serve.kv.append":
             return self._serve_kv_append(
+                [environment[value.name] for value in operands],
+                attributes,
+            )
+        if name == "serve.kv.init":
+            return self._serve_kv_init(
+                [environment[value.name] for value in operands],
+                attributes,
+            )
+        if name == "serve.kv.prefill_store":
+            return self._serve_kv_prefill_store(
                 [environment[value.name] for value in operands],
                 attributes,
             )
@@ -537,6 +690,81 @@ class ReferenceExecutor:
         return (normalized * weight.float()).to(torch_dtype)
 
     @staticmethod
+    def _serve_linear(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> torch.Tensor:
+        if len(operands) not in {2, 3}:
+            raise ExecutionError("serve.linear 需要 input、weight 和可选 bias")
+        tensor, weight = operands[:2]
+        bias = operands[2] if len(operands) == 3 else None
+        if bool(attributes.get("has_bias")) != (bias is not None):
+            raise ExecutionError("serve.linear 的 has_bias 与运行时参数不一致")
+        return F.linear(tensor, weight, bias)
+
+    @staticmethod
+    def _serve_prefill_attention(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> torch.Tensor:
+        if len(operands) != 4:
+            raise ExecutionError(
+                "serve.prefill_attention需要query、key、value和mask"
+            )
+        query, key, value, attention_mask = operands
+        groups = int(attributes["groups"])
+        if query.shape[1] != key.shape[1] * groups:
+            raise ExecutionError("serve.prefill_attention的GQA groups不匹配")
+        expanded_key = key.repeat_interleave(groups, dim=1)
+        expanded_value = value.repeat_interleave(groups, dim=1)
+        scores = torch.matmul(query, expanded_key.transpose(-2, -1))
+        # 保留原图“Score DType缩放后再Cast到FP32”的舍入顺序。
+        scores = scores * float(attributes["scale"])
+        scores = scores.float() + attention_mask.float()
+        if attributes.get("causal") is True:
+            tokens = query.shape[2]
+            future = torch.triu(
+                torch.ones(
+                    tokens,
+                    tokens,
+                    dtype=torch.bool,
+                    device=query.device,
+                ),
+                diagonal=1,
+            )
+            scores = scores.masked_fill(future, float("-inf"))
+        probabilities = torch.softmax(scores, dim=-1).to(query.dtype)
+        return torch.matmul(probabilities, expanded_value)
+
+    @staticmethod
+    def _serve_rope(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """执行Qwen2约定的前后半维旋转位置编码。"""
+
+        if len(operands) != 4:
+            raise ExecutionError("serve.rope需要query、key、cosine和sine")
+        query, key, cosine, sine = operands
+        head_dim = query.shape[-1]
+        if head_dim != int(attributes["head_dim"]) or head_dim % 2:
+            raise ExecutionError("serve.rope的Head Dim契约不匹配")
+
+        def rotate_half(tensor: torch.Tensor) -> torch.Tensor:
+            half = tensor.shape[-1] // 2
+            return torch.cat(
+                (-tensor[..., half:], tensor[..., :half]),
+                dim=-1,
+            )
+
+        cosine = cosine.unsqueeze(1)
+        sine = sine.unsqueeze(1)
+        return (
+            query * cosine + rotate_half(query) * sine,
+            key * cosine + rotate_half(key) * sine,
+        )
+
+    @staticmethod
     def _serve_kv_append(
         operands: list[Any],
         attributes: dict[str, Any],
@@ -556,6 +784,38 @@ class ReferenceExecutor:
             key,
             value,
             axis=int(attributes.get("axis", 2)),
+        )
+
+    @staticmethod
+    def _serve_kv_init(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> PreallocatedKVCacheState:
+        if len(operands) != 1 or not isinstance(operands[0], torch.Tensor):
+            raise ExecutionError("serve.kv.init需要一个Key Tensor模板")
+        return PreallocatedKVCacheState.empty_from_key_template(
+            operands[0],
+            num_layers=int(attributes["num_layers"]),
+            capacity=int(attributes["capacity"]),
+        )
+
+    @staticmethod
+    def _serve_kv_prefill_store(
+        operands: list[Any],
+        attributes: dict[str, Any],
+    ) -> PreallocatedKVCacheState:
+        if len(operands) != 3 or not isinstance(
+            operands[0],
+            PreallocatedKVCacheState,
+        ):
+            raise ExecutionError(
+                "serve.kv.prefill_store需要state、key和value"
+            )
+        state, key, value = operands
+        return state.prefill_store(
+            int(attributes.get("slot", 0)),
+            key,
+            value,
         )
 
     @staticmethod
@@ -656,7 +916,7 @@ def bind_exported_program_arguments(
         kind = spec.kind.name
         name = spec.arg.name
         if kind in {"PARAMETER", "BUFFER"}:
-            arguments.append(program.state_dict[spec.target])
+            arguments.append(_exported_state_value(program, spec.target))
         elif kind == "CONSTANT_TENSOR":
             arguments.append(program.constants[spec.target])
         elif kind == "USER_INPUT":
@@ -684,37 +944,94 @@ def bind_stateful_decode_arguments(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
     state: KVCacheState | PreallocatedKVCacheState,
+    *,
+    extra_user_inputs: Mapping[str, Any] | None = None,
+    primary_input_name: str = "hidden_states",
 ) -> list[Any]:
-    """绑定改写后的 Decode 参数，用一个状态替代两个 Tensor Cache 输入。"""
+    """绑定改写后的 Decode 参数，用一个状态替代全部 Layer Cache 输入。"""
 
     user_values = {
-        "hidden_states": hidden_states,
+        primary_input_name: hidden_states,
         "attention_mask": attention_mask,
     }
+    if extra_user_inputs is not None:
+        overlap = set(user_values) & set(extra_user_inputs)
+        if overlap:
+            raise ExecutionError(
+                f"额外 Stateful 输入不能覆盖保留参数：{sorted(overlap)}"
+            )
+        user_values.update(extra_user_inputs)
     arguments = []
     state_inserted = False
+    cache_components: dict[int, set[str]] = {}
     for spec in program.graph_signature.input_specs:
         kind = spec.kind.name
         name = spec.arg.name
         if kind in {"PARAMETER", "BUFFER"}:
-            arguments.append(program.state_dict[spec.target])
+            arguments.append(_exported_state_value(program, spec.target))
         elif kind == "CONSTANT_TENSOR":
             arguments.append(program.constants[spec.target])
         elif kind == "USER_INPUT":
-            if name == "past_key":
-                arguments.append(state)
-                state_inserted = True
-            elif name == "past_value":
+            cache_input = _stateful_cache_input(name)
+            if cache_input is not None:
+                slot, component = cache_input
+                cache_components.setdefault(slot, set()).add(component)
+                if not state_inserted:
+                    arguments.append(state)
+                    state_inserted = True
                 continue
-            elif name in user_values:
+            if name in user_values:
                 arguments.append(user_values[name])
             else:
                 raise ExecutionError(f"不支持的 Stateful Decode 输入 {name}")
         else:
             raise ExecutionError(f"暂不支持 Graph InputKind：{kind}")
     if not state_inserted:
-        raise ExecutionError("导出程序没有 past_key 输入")
+        raise ExecutionError("导出程序没有 KV Cache 输入")
+    expected_slots = list(range(len(cache_components)))
+    if sorted(cache_components) != expected_slots or any(
+        components != {"key", "value"}
+        for components in cache_components.values()
+    ):
+        raise ExecutionError("导出程序的多层 KV Cache 输入不完整")
+    if len(state.keys) != len(cache_components):
+        raise ExecutionError(
+            f"运行时状态有 {len(state.keys)} 个 Slot，导出程序需要 "
+            f"{len(cache_components)} 个"
+        )
     return arguments
+
+
+def _exported_state_value(
+    program: torch.export.ExportedProgram,
+    target: str,
+) -> Any:
+    """读取持久参数/Buffer，兼容 persistent=False Buffer 的常量存储。"""
+
+    if target in program.state_dict:
+        return program.state_dict[target]
+    if target in program.constants:
+        return program.constants[target]
+    raise ExecutionError(f"导出程序缺少参数或 Buffer：{target}")
+
+
+def _stateful_cache_input(name: str) -> tuple[int, str] | None:
+    """解析单层旧名称和 torch.export 展平后的多层 Cache 名称。"""
+
+    if name == "past_key":
+        return 0, "key"
+    if name == "past_value":
+        return 0, "value"
+    nested = re.fullmatch(r"past_key_values_(\d+)_(0|1)", name)
+    if nested is not None:
+        return (
+            int(nested.group(1)),
+            "key" if nested.group(2) == "0" else "value",
+        )
+    indexed = re.fullmatch(r"past_(key|value)_(\d+)", name)
+    if indexed is not None:
+        return int(indexed.group(2)), indexed.group(1)
+    return None
 
 
 def _select_function(

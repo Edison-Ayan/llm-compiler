@@ -263,6 +263,9 @@ def _verify_function(function: Function, errors: list[str]) -> None:
             names.add(result.name)
             defined.add(result)
         _verify_kv_operation(operation, errors)
+        _verify_linear_operation(operation, errors)
+        _verify_rope_operation(operation, errors)
+        _verify_prefill_attention(operation, errors)
 
     for returned in function.returns:
         if returned not in defined:
@@ -273,13 +276,18 @@ def _verify_function(function: Function, errors: list[str]) -> None:
 
 def _verify_kv_operation(operation: Operation, errors: list[str]) -> None:
     if operation.name not in {
+        "serve.kv.init",
         "serve.kv.read",
         "serve.kv.append",
         "serve.kv.length",
         "serve.kv.store",
         "serve.kv.advance",
+        "serve.kv.prefill_store",
         "serve.decode_attention",
     }:
+        return
+    if operation.name == "serve.kv.init":
+        _verify_kv_init(operation, errors)
         return
     if not operation.operands or not isinstance(
         operation.operands[0].type, KVStateType
@@ -287,7 +295,18 @@ def _verify_kv_operation(operation: Operation, errors: list[str]) -> None:
         errors.append(f"{operation.name} 的第一个操作数必须是 KVStateType")
         return
 
-    resource = operation.operands[0].type.resource
+    state_type = operation.operands[0].type
+    slot = operation.attributes.get("slot", 0)
+    if (
+        not isinstance(slot, int)
+        or slot < 0
+        or slot >= state_type.num_layers
+    ):
+        errors.append(
+            f"{operation.name} 的 slot 必须位于 "
+            f"[0, {state_type.num_layers})"
+        )
+    resource = state_type.resource
     effect_pairs = {(effect.kind, effect.resource) for effect in operation.effects}
     if (EffectKind.READ, resource) not in effect_pairs:
         errors.append(f"{operation.name} 缺少 read({resource}) 副作用")
@@ -296,6 +315,7 @@ def _verify_kv_operation(operation: Operation, errors: list[str]) -> None:
         "serve.kv.append",
         "serve.kv.store",
         "serve.kv.advance",
+        "serve.kv.prefill_store",
     } and (EffectKind.WRITE, resource) not in effect_pairs:
         errors.append(f"{operation.name} 缺少 write({resource}) 副作用")
 
@@ -377,8 +397,274 @@ def _verify_kv_operation(operation: Operation, errors: list[str]) -> None:
             or operation.results[0].type != operation.operands[0].type
         ):
             errors.append("serve.kv.advance 必须返回同类型的新状态")
+    elif operation.name == "serve.kv.prefill_store":
+        if len(operation.operands) != 3:
+            errors.append("serve.kv.prefill_store必须接收state、key和value")
+        else:
+            _verify_kv_tensor(
+                operation.operands[1].type,
+                operation.operands[0].type,
+                "serve.kv.prefill_store的key",
+                errors,
+            )
+            _verify_kv_tensor(
+                operation.operands[2].type,
+                operation.operands[0].type,
+                "serve.kv.prefill_store的value",
+                errors,
+            )
+        if (
+            len(operation.results) != 1
+            or operation.results[0].type != operation.operands[0].type
+        ):
+            errors.append("serve.kv.prefill_store必须返回同类型的新状态")
     elif operation.name == "serve.decode_attention":
         _verify_decode_attention(operation, errors)
+
+
+def _verify_kv_init(operation: Operation, errors: list[str]) -> None:
+    """验证根据首层Key模板创建预分配多层状态的契约。"""
+
+    if len(operation.operands) != 1 or len(operation.results) != 1:
+        errors.append("serve.kv.init必须接收Key模板并返回一个状态")
+        return
+    template_type = operation.operands[0].type
+    state_type = operation.results[0].type
+    if not isinstance(state_type, KVStateType):
+        errors.append("serve.kv.init必须返回KVStateType")
+        return
+    if state_type.layout != "contiguous_bshd" or state_type.capacity is None:
+        errors.append("serve.kv.init必须创建有Capacity的contiguous_bshd状态")
+    _verify_kv_tensor(
+        template_type,
+        state_type,
+        "serve.kv.init的Key模板",
+        errors,
+    )
+    if operation.attributes.get("num_layers") != state_type.num_layers:
+        errors.append("serve.kv.init的num_layers与状态类型不匹配")
+    if operation.attributes.get("capacity") != state_type.capacity:
+        errors.append("serve.kv.init的capacity与状态类型不匹配")
+    effect_pairs = {
+        (effect.kind, effect.resource) for effect in operation.effects
+    }
+    if (EffectKind.ALLOCATE, state_type.resource) not in effect_pairs:
+        errors.append("serve.kv.init缺少allocate副作用")
+    if (EffectKind.WRITE, state_type.resource) not in effect_pairs:
+        errors.append("serve.kv.init缺少write副作用")
+
+
+def _verify_linear_operation(
+    operation: Operation,
+    errors: list[str],
+) -> None:
+    """验证 ServeIR 和 KernelIR Linear 的 Shape、DType 与 Bias 契约。"""
+
+    if operation.name not in {
+        "serve.linear",
+        "kernel.triton.linear",
+    }:
+        return
+    if len(operation.operands) not in {2, 3}:
+        errors.append(f"{operation.name} 必须接收 input、weight 和可选 bias")
+        return
+    if len(operation.results) != 1:
+        errors.append(f"{operation.name} 必须返回一个 Tensor")
+        return
+
+    input_type = operation.operands[0].type
+    weight_type = operation.operands[1].type
+    result_type = operation.results[0].type
+    if not all(
+        isinstance(type_, TensorType)
+        for type_ in (input_type, weight_type, result_type)
+    ):
+        errors.append(f"{operation.name} 的 input、weight 和结果必须是 Tensor")
+        return
+    if len(input_type.shape) not in {2, 3}:
+        errors.append(f"{operation.name} 的 input 只支持二维或三维 Tensor")
+        return
+    if len(weight_type.shape) != 2:
+        errors.append(f"{operation.name} 的 weight 必须是二维 N×K Tensor")
+        return
+    if len(result_type.shape) != len(input_type.shape):
+        errors.append(f"{operation.name} 的结果 Rank 必须与 input 相同")
+        return
+
+    output_features, input_features = weight_type.shape
+    if input_type.shape[-1] != input_features:
+        errors.append(f"{operation.name} 的 input 最后一维必须等于 weight 的 K")
+    if result_type.shape[:-1] != input_type.shape[:-1]:
+        errors.append(f"{operation.name} 的结果前导维必须与 input 相同")
+    if result_type.shape[-1] != output_features:
+        errors.append(f"{operation.name} 的结果最后一维必须等于 weight 的 N")
+    if not (
+        input_type.dtype == weight_type.dtype == result_type.dtype
+        and input_type.device == weight_type.device == result_type.device
+    ):
+        errors.append(f"{operation.name} 的 Tensor DType 和 Device 必须一致")
+
+    has_bias = operation.attributes.get("has_bias")
+    if has_bias is not (len(operation.operands) == 3):
+        errors.append(f"{operation.name} 的 has_bias 与操作数数量不一致")
+    if len(operation.operands) == 3:
+        bias_type = operation.operands[2].type
+        if not isinstance(bias_type, TensorType) or bias_type.shape != (
+            output_features,
+        ):
+            errors.append(f"{operation.name} 的 bias 必须是一维 N Tensor")
+        elif (
+            bias_type.dtype != input_type.dtype
+            or bias_type.device != input_type.device
+        ):
+            errors.append(f"{operation.name} 的 bias DType 和 Device 必须匹配")
+
+    for attribute, dimension in (
+        ("input_features", input_features),
+        ("output_features", output_features),
+    ):
+        value = operation.attributes.get(attribute)
+        if not isinstance(dimension, StaticDim) or value != dimension.value:
+            errors.append(f"{operation.name} 的 {attribute} Attribute 不匹配")
+
+
+def _verify_prefill_attention(
+    operation: Operation,
+    errors: list[str],
+) -> None:
+    """验证多Token Causal GQA Prefill Attention的高层契约。"""
+
+    if operation.name not in {
+        "serve.prefill_attention",
+        "kernel.triton.prefill_attention",
+    }:
+        return
+    if len(operation.operands) != 4 or len(operation.results) != 1:
+        errors.append(
+            f"{operation.name} 必须接收query、key、value、mask并返回context"
+        )
+        return
+    query_type, key_type, value_type, mask_type = (
+        operand.type for operand in operation.operands
+    )
+    context_type = operation.results[0].type
+    tensor_types = (
+        query_type,
+        key_type,
+        value_type,
+        mask_type,
+        context_type,
+    )
+    if not all(isinstance(type_, TensorType) for type_ in tensor_types):
+        errors.append(f"{operation.name} 的所有操作数和结果必须是Tensor")
+        return
+    if any(len(type_.shape) != 4 for type_ in tensor_types):
+        errors.append(f"{operation.name} 的Tensor必须全部是四维")
+        return
+
+    groups = operation.attributes.get("groups")
+    query_heads = query_type.shape[1]
+    kv_heads = key_type.shape[1]
+    if (
+        not isinstance(groups, int)
+        or groups <= 0
+        or not isinstance(query_heads, StaticDim)
+        or not isinstance(kv_heads, StaticDim)
+        or query_heads.value != kv_heads.value * groups
+    ):
+        errors.append(f"{operation.name} 的GQA groups或Head数量不匹配")
+    if key_type != value_type:
+        errors.append(f"{operation.name} 的key和value类型必须一致")
+    tokens = query_type.shape[2]
+    if not (
+        query_type.shape[0] == key_type.shape[0] == mask_type.shape[0]
+        and tokens == key_type.shape[2]
+        and tokens == mask_type.shape[2] == mask_type.shape[3]
+        and query_type.shape[3] == key_type.shape[3]
+    ):
+        errors.append(f"{operation.name} 的Batch、Token或Head Dim不匹配")
+    if (
+        not isinstance(mask_type.shape[1], StaticDim)
+        or mask_type.shape[1].value != 1
+    ):
+        errors.append(f"{operation.name} 的mask Head维必须为1")
+    if context_type != query_type:
+        errors.append(f"{operation.name} 的context类型必须与query一致")
+    if not (
+        query_type.dtype == key_type.dtype
+        and query_type.device == key_type.device == mask_type.device
+    ):
+        errors.append(f"{operation.name} 的Q/K/V DType或Device不匹配")
+    scale = operation.attributes.get("scale")
+    if not isinstance(scale, (int, float)) or float(scale) <= 0:
+        errors.append(f"{operation.name} 的scale必须为正数")
+    if operation.attributes.get("causal") not in {True, "mask"}:
+        errors.append(f"{operation.name} 必须声明Causal由Kernel或Mask提供")
+
+
+def _verify_rope_operation(
+    operation: Operation,
+    errors: list[str],
+) -> None:
+    """验证Qwen2半维旋转RoPE的Shape、DType和双结果契约。"""
+
+    if operation.name not in {"serve.rope", "kernel.triton.rope"}:
+        return
+    if len(operation.operands) != 4 or len(operation.results) != 2:
+        errors.append(
+            f"{operation.name}必须接收query、key、cosine、sine并返回两个Tensor"
+        )
+        return
+    query_type, key_type, cosine_type, sine_type = (
+        operand.type for operand in operation.operands
+    )
+    result_query_type, result_key_type = (
+        result.type for result in operation.results
+    )
+    if not all(
+        isinstance(type_, TensorType)
+        for type_ in (
+            query_type,
+            key_type,
+            cosine_type,
+            sine_type,
+            result_query_type,
+            result_key_type,
+        )
+    ):
+        errors.append(f"{operation.name}的操作数和结果必须全部是Tensor")
+        return
+    if len(query_type.shape) != 4 or len(key_type.shape) != 4:
+        errors.append(f"{operation.name}的query和key必须是B×H×T×D")
+        return
+    if len(cosine_type.shape) != 3 or len(sine_type.shape) != 3:
+        errors.append(f"{operation.name}的cosine和sine必须是B×T×D")
+        return
+    head_dim = query_type.shape[3]
+    if not (
+        query_type.shape[0] == key_type.shape[0]
+        and query_type.shape[2:] == key_type.shape[2:]
+        and cosine_type.shape
+        == (query_type.shape[0], query_type.shape[2], head_dim)
+        and sine_type == cosine_type
+    ):
+        errors.append(f"{operation.name}的Batch、Token或Head Dim不匹配")
+    if not (
+        query_type.dtype == key_type.dtype == cosine_type.dtype
+        and query_type.device == key_type.device == cosine_type.device
+    ):
+        errors.append(f"{operation.name}的DType或Device不匹配")
+    if result_query_type != query_type or result_key_type != key_type:
+        errors.append(f"{operation.name}的两个结果必须分别匹配query和key")
+    if (
+        not isinstance(head_dim, StaticDim)
+        or head_dim.value <= 0
+        or head_dim.value % 2
+        or operation.attributes.get("head_dim") != head_dim.value
+    ):
+        errors.append(f"{operation.name}要求偶数静态Head Dim且Attribute必须匹配")
+    if operation.attributes.get("variant") != "qwen2_half_rotation":
+        errors.append(f"{operation.name}只支持qwen2_half_rotation变体")
 
 
 def _verify_decode_attention(

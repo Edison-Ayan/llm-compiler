@@ -12,12 +12,18 @@ import torch
 from .cost_model import RMSNormCostModel
 from .importer import import_exported_program
 from .ir import format_module
+from .lowering import require_full_lowering
 from .pass_manager import PassManager
 from .passes import (
     BufferizeKVCachePass,
     FuseDecodeAttentionPass,
+    FusePrefillAttentionPass,
+    FuseRoPEPass,
     FuseRMSNormPass,
+    LowerToKernelIRPass,
     MaterializeKVStatePass,
+    MaterializePrefillKVStatePass,
+    NormalizeLinearPass,
     RemoveExportAssertionsPass,
     SelectRMSNormLoweringPass,
 )
@@ -29,11 +35,20 @@ def default_pass_manager(
     stateful_decode: bool = False,
     preallocate_kv: bool = False,
     kv_capacity: int | None = None,
+    lower_to_kernel_ir: bool = False,
+    prefill_kv_state: bool = False,
 ) -> PassManager:
     passes = [
         RemoveExportAssertionsPass(),
+        NormalizeLinearPass(),
         FuseRMSNormPass(),
+        FuseRoPEPass(),
+        FusePrefillAttentionPass(),
     ]
+    if prefill_kv_state:
+        passes.append(
+            MaterializePrefillKVStatePass(capacity=kv_capacity)
+        )
     if stateful_decode or preallocate_kv:
         passes.append(MaterializeKVStatePass())
     if preallocate_kv:
@@ -41,6 +56,8 @@ def default_pass_manager(
         passes.append(FuseDecodeAttentionPass())
     if cost_model is not None:
         passes.append(SelectRMSNormLoweringPass(cost_model))
+    if lower_to_kernel_ir:
+        passes.append(LowerToKernelIRPass())
     return PassManager(passes)
 
 
@@ -72,6 +89,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="覆盖导出动态上界推导出的 KV Buffer Capacity",
     )
+    parser.add_argument(
+        "--prefill-kv-state",
+        action="store_true",
+        help="把Prefill返回的多层K/V物化为预分配状态",
+    )
+    parser.add_argument(
+        "--lower-kernel-ir",
+        action="store_true",
+        help="把已支持的 ServeIR 操作 Lower 为 KernelIR",
+    )
+    parser.add_argument(
+        "--require-full-lowering",
+        action="store_true",
+        help="要求 KernelIR 零 ATen/参考执行器回退",
+    )
     return parser
 
 
@@ -88,7 +120,13 @@ def main() -> None:
         stateful_decode=args.stateful_decode,
         preallocate_kv=args.preallocate_kv,
         kv_capacity=args.kv_capacity,
+        prefill_kv_state=args.prefill_kv_state,
+        lower_to_kernel_ir=(
+            args.lower_kernel_ir or args.require_full_lowering
+        ),
     ).run(module)
+    if args.require_full_lowering:
+        require_full_lowering(module)
     after = format_module(module)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

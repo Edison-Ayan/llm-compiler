@@ -71,7 +71,7 @@ class ReferenceExecutionTest(unittest.TestCase):
             result = self.executor.run(module, arguments)
         actual = result.outputs[0]
         torch.testing.assert_close(actual, expected)
-        self.assertEqual(len(result.executed_operations), 44)
+        self.assertEqual(len(result.executed_operations), 35)
         return float((actual.float() - expected.float()).abs().max())
 
     def test_optimized_ir_matches_multiple_dynamic_shapes(self) -> None:
@@ -121,4 +121,3 @@ class ReferenceExecutionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

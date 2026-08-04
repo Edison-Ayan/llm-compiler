@@ -47,6 +47,10 @@ GQA Group 一致、Softmax 位于最后一维，并且 KV Layout 已经是
 %context = aten.matmul(%probability, %value_gqa)
 ```
 
+缩放既可以是旧前端产生的 `%scores / sqrt(head_dim)`，也可以是 Hugging Face Qwen2
+使用的 `%scores * head_dim**-0.5`。Pass 只接受编译期正数，并分别转换为统一 `scale`
+属性；除法仍严格要求 Score 位于左操作数。
+
 融合后：
 
 ```text
@@ -167,6 +171,7 @@ Triton vs PyTorch SDPA：1.650×
 - 只支持单 Token Query；
 - 只支持连续 `B×Capacity×KVHead×HeadDim` Layout；
 - 尚未支持 Paged KV、Block Table 和非连续请求页；
-- 尚未实现多层 Slot 自动规划；
+- 已能从 Hugging Face 风格嵌套 Cache 自动恢复连续多层 Slot，并逐层融合 Attention；
+- 尚未实现异构 Layer Slot、跨 Layer 并行和统一显存规划；
 - Kernel 参数仍是固定 `block_tokens=32`，没有 Profile-Guided 调度；
 - 当前实验是单算子延迟，不是完整模型的端到端 Token/s。
